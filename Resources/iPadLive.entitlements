@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	The app is signed with the hardened runtime, which blocks code injection and
+	only allows the privacy-sensitive resources listed here. iPad Live needs exactly two:
+	-->
+	<!-- macOS treats a plugged-in iPad's screen as a camera. -->
+	<key>com.apple.security.device.camera</key>
+	<true/>
+	<!-- macOS treats a plugged-in iPad's sound as a microphone ("Play iPad Sound on This Mac"). -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

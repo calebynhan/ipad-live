@@ -97,6 +97,7 @@ iPad Live only *shows* your iPad. You keep drawing and tapping on the iPad itsel
 - Unlock the iPad, and tap **Trust** if it asks.
 - Try another cable. Some cables only charge and don't carry data. If Finder doesn't show your iPad in its sidebar, the cable or port is the problem.
 - Unplug and plug back in, or press ⌘R.
+- If Finder sees the iPad but iPad Live never does, rebuild once without the hardened runtime to rule it out: `HARDENED_RUNTIME=0 make install`. If that fixes it, the hardened runtime is what was blocking the iPad.
 
 **The picture is black**
 - Unlock the iPad. The picture pauses while it's locked or asleep.
@@ -120,6 +121,13 @@ iPad Live uses a cable on purpose, because that's what makes it lag-free. If you
 - `MirrorWindowController.swift` is the chrome-free window: it reshapes on rotation, hides its buttons when the pointer leaves, and hides the pointer when it rests over the picture.
 - `Sources/iPadLiveCore` holds the layout math, with unit tests (`make test`, needs full Xcode).
 
+## Security
+
+- **Only what it needs:** iPad Live only opens plugged-in iPads and iPhones. It never turns on your Mac's own camera or microphone, makes no network connections, and runs no other programs.
+- **Hardened runtime:** the app is signed with Apple's hardened runtime, which stops other software from injecting code into it and borrowing its camera permission. Its entitlements (`Resources/iPadLive.entitlements`) allow exactly two things: camera (the iPad's screen) and audio input (the iPad's sound).
+- **Sharing the app with others:** build with your Developer ID so it can be notarized by Apple: `SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" make app`
+- **CI:** the GitHub workflow has read-only access, pins each action to an exact commit, and checks that every build is signed with the hardened runtime and the two entitlements above.
+
 ## Project layout
 
 ```
@@ -129,6 +137,7 @@ Sources/iPadLiveCore/         Layout math (unit tested)
 Tests/iPadLiveCoreTests/      Tests for the layout math
 Resources/Info.plist          App info and permission messages
 Resources/AppIcon.icns        App icon
+Resources/iPadLive.entitlements  What the hardened runtime allows (camera + audio input)
 scripts/build-app.sh          Builds and signs build/iPad Live.app
 Makefile                      make app | run | install | test | clean
 ```
