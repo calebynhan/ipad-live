@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreMedia
 
 /// Owns the capture session that pulls the iPad's screen over USB, and keeps it connected:
@@ -38,7 +38,8 @@ final class MirrorSession {
     let session = AVCaptureSession()
 
     private let sessionQueue = DispatchQueue(label: "app.ipadlive.capture-session", qos: .userInteractive)
-    private let discovery = ScreenCaptureDevices.makeDiscoverySession()
+    /// Created on first use, which is after `ScreenCaptureDevices.enable()` has run in `start()`.
+    private lazy var discovery = ScreenCaptureDevices.makeDiscoverySession()
     private var currentInput: AVCaptureDeviceInput?
     /// Bumped on every connect/disconnect so results from an older attempt are ignored.
     private var generation = 0
