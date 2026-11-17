@@ -11,6 +11,10 @@ CONFIGURATION="${CONFIGURATION:-release}"
 # "-" signs the app ad hoc, which is all you need to run it on your own Mac.
 # Set SIGN_IDENTITY to a "Developer ID Application: ..." identity to share it with others.
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+# The hardened runtime blocks other code from injecting into the app and borrowing its
+# camera permission. Set HARDENED_RUNTIME=0 only to rule it out while troubleshooting.
+HARDENED_RUNTIME="${HARDENED_RUNTIME:-1}"
+ENTITLEMENTS="Resources/iPadLive.entitlements"
 APP="build/${APP_NAME}.app"
 
 if [[ "$(uname)" != "Darwin" ]]; then
@@ -35,7 +39,16 @@ cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 echo "==> Signing"
-codesign --force --sign "$SIGN_IDENTITY" "$APP"
+SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
+if [[ "$HARDENED_RUNTIME" == "1" ]]; then
+  SIGN_ARGS+=(--options runtime --entitlements "$ENTITLEMENTS")
+else
+  echo "warning: signing WITHOUT the hardened runtime (HARDENED_RUNTIME=0)" >&2
+fi
+if [[ "$SIGN_IDENTITY" != "-" ]]; then
+  SIGN_ARGS+=(--timestamp) # a secure timestamp is required for notarization
+fi
+codesign "${SIGN_ARGS[@]}" "$APP"
 
 echo
 echo "Built: $APP"

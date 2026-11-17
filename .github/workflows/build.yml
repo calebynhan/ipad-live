@@ -5,6 +5,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# The workflow only reads the code; it never pushes, comments or publishes releases.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build (${{ matrix.os }})
@@ -15,7 +19,10 @@ jobs:
         os: [macos-15, macos-26]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      # Actions are pinned to exact commits so a moved or compromised tag can't change what runs.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Toolchain
         run: |
@@ -31,11 +38,23 @@ jobs:
 
       - name: Check the app bundle
         run: |
+          set -euo pipefail
           APP="build/iPad Live.app"
           plutil -lint "$APP/Contents/Info.plist"
           codesign --verify --strict --verbose=2 "$APP"
           file "$APP/Contents/MacOS/iPadLive"
           test -f "$APP/Contents/Resources/AppIcon.icns"
+
+          # Signed with the hardened runtime...
+          SIGNATURE="$(codesign -dv "$APP" 2>&1)"
+          echo "$SIGNATURE"
+          grep -q 'flags=.*runtime' <<<"$SIGNATURE"
+          # ...and allowed nothing beyond camera + audio input.
+          codesign -d --entitlements - --xml "$APP" > entitlements.plist
+          plutil -p entitlements.plist
+          test "$(plutil -extract com.apple.security.device.camera raw entitlements.plist)" = "true"
+          test "$(plutil -extract com.apple.security.device.audio-input raw entitlements.plist)" = "true"
+          test "$(plutil -p entitlements.plist | grep -c '=>')" = "2"
 
       - name: Zip
         if: matrix.os == 'macos-15'
@@ -43,7 +62,7 @@ jobs:
 
       - name: Upload
         if: matrix.os == 'macos-15'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: iPad-Live
           path: build/iPad-Live.zip
