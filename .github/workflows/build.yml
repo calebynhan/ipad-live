@@ -52,8 +52,9 @@ jobs:
           # ...and allowed nothing beyond camera + audio input.
           codesign -d --entitlements - --xml "$APP" > entitlements.plist
           plutil -p entitlements.plist
-          test "$(plutil -extract com.apple.security.device.camera raw entitlements.plist)" = "true"
-          test "$(plutil -extract com.apple.security.device.audio-input raw entitlements.plist)" = "true"
+          # (PlistBuddy, because plutil -extract would treat the dots in these keys as a path.)
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.camera' entitlements.plist)" = "true"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' entitlements.plist)" = "true"
           test "$(plutil -p entitlements.plist | grep -c '=>')" = "2"
 
       - name: Zip
