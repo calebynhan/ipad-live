@@ -24,7 +24,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
 
     init(mirror: MirrorSession) {
         self.mirror = mirror
-        self.mirrorView = MirrorView(session: mirror.session)
+        self.mirrorView = MirrorView(session: mirror.session, displayLayer: mirror.frameSink.displayLayer)
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 900, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -39,6 +39,10 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
 
         mirror.onStateChange = { [weak self] state in self?.render(state) }
         mirror.onVideoSizeChange = { [weak self] size in self?.videoSizeChanged(size) }
+        mirror.onRenderStateChange = { [weak self] previewAttached, lowLatencyLayerVisible in
+            self?.mirrorView.setRenderState(previewAttached: previewAttached, showsLowLatencyLayer: lowLatencyLayerVisible)
+        }
+        mirrorView.setRenderState(previewAttached: !Settings.lowLatency, showsLowLatencyLayer: Settings.lowLatency)
         render(mirror.state)
     }
 

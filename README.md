@@ -82,6 +82,7 @@ You can also go full screen (double-click the picture) and share your whole scre
 | Move the window | Drag anywhere on the picture |
 | Full screen | Double-click the picture, or ⌃⌘F |
 | Fit window to the iPad's shape | ⌘0 |
+| Low-Latency Mode (on by default) | ⌘L |
 | Hide iPad status bar | ⌘B |
 | Float on top | ⌥⌘T |
 | Reconnect | ⌘R |
@@ -109,6 +110,20 @@ iPad Live only *shows* your iPad. You keep drawing and tapping on the iPad itsel
 **My iPad went quiet while connected**
 - While it's connected, the iPad may send its sound to the Mac. Turn on **Device → Play iPad Sound on This Mac** to hear it. macOS asks for Microphone permission, because it treats the iPad's sound like a microphone. Your Mac's own microphone is never used.
 
+## About the delay
+
+There's a small delay between the iPad and the Mac, and most of it can't be removed by any app: over USB, the iPad compresses its screen into video and the Mac decompresses it (QuickTime Player has the same delay).
+
+**Low-Latency Mode** (View menu, ⌘L, on by default) cuts what the Mac side adds. Each frame is shown the moment it arrives instead of being scheduled by its timestamp, and if the Mac ever falls behind it skips stale frames rather than queueing them. Turn it off to compare with Apple's standard preview, or if the picture ever misbehaves.
+
+**To compare the two modes,** open a stopwatch with milliseconds on the iPad, put the Mac window next to it, and take a photo of both screens. The difference between the two readings is the delay.
+
+Other things that help:
+- Plug the cable straight into the Mac rather than through a hub or dock.
+- Turn off Low Power Mode on the iPad and the Mac.
+
+**What your audience sees:** Zoom, Meet and FaceTime add their own delay on top, usually more than this. Since you draw looking at the iPad, the iPad-to-Mac delay mostly matters if you watch the Mac window.
+
 ## Wireless?
 
 iPad Live uses a cable on purpose, because that's what makes it lag-free. If you can live with some delay, macOS has wireless mirroring built in: on the iPad, open **Control Center → Screen Mirroring** and choose your Mac. Expect a fraction of a second of lag and the occasional stutter on busy Wi-Fi.
@@ -117,7 +132,8 @@ iPad Live uses a cable on purpose, because that's what makes it lag-free. If you
 
 - `ScreenCaptureDevices.swift` turns on CoreMediaIO's `kCMIOHardwarePropertyAllowScreenCaptureDevices`. Every app has this off by default. Once it's on, connected iPads and iPhones appear to AVFoundation as external "muxed" (video + audio) capture devices.
 - `MirrorSession.swift` watches for those devices, opens the iPad in an `AVCaptureSession` on a background queue, and handles unplugging, errors and rotation.
-- `MirrorView.swift` draws the session with `AVCaptureVideoPreviewLayer`. Frames go to the window server on the GPU without being copied or re-encoded, which is the lowest-latency way to show a capture device on macOS. A clipping layer trims the status bar.
+- `FrameSink.swift` is Low-Latency Mode: an `AVCaptureVideoDataOutput` (dropping late frames) feeds an `AVSampleBufferDisplayLayer`, and every frame is marked `kCMSampleAttachmentKey_DisplayImmediately` so it's shown on arrival instead of at its timestamp.
+- `MirrorView.swift` holds the picture: Low-Latency Mode's display layer, or Apple's `AVCaptureVideoPreviewLayer` when the mode is off. A clipping layer trims the status bar.
 - `MirrorWindowController.swift` is the chrome-free window: it reshapes on rotation, hides its buttons when the pointer leaves, and hides the pointer when it rests over the picture.
 - `Sources/iPadLiveCore` holds the layout math, with unit tests (`make test`, needs full Xcode).
 

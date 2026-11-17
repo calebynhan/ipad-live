@@ -22,6 +22,9 @@ final class MirrorSession {
     var onVideoSizeChange: ((CGSize?) -> Void)?
     var onDevicesChange: (() -> Void)?
     var onAudioPermissionDenied: (() -> Void)?
+    /// Which picture path the window should show: `previewAttached` connects Apple's standard
+    /// preview layer; `lowLatencyLayerVisible` shows Low-Latency Mode's layer (drawn on top).
+    var onRenderStateChange: ((_ previewAttached: Bool, _ lowLatencyLayerVisible: Bool) -> Void)?
 
     private(set) var state: State = .starting {
         didSet { if state != oldValue { onStateChange?(state) } }
@@ -36,11 +39,15 @@ final class MirrorSession {
     private(set) var activeDevice: AVCaptureDevice?
 
     let session = AVCaptureSession()
+    /// Draws frames for Low-Latency Mode. Its layer lives in the window.
+    let frameSink = FrameSink()
 
     private let sessionQueue = DispatchQueue(label: "app.ipadlive.capture-session", qos: .userInteractive)
     /// Created on first use, which is after `ScreenCaptureDevices.enable()` has run in `start()`.
     private lazy var discovery = ScreenCaptureDevices.makeDiscoverySession()
     private var currentInput: AVCaptureDeviceInput?
+    /// A frame size that arrived while still connecting; applied once the connection is live.
+    private var pendingFrameSize: CGSize?
     /// Bumped on every connect/disconnect so results from an older attempt are ignored.
     private var generation = 0
     /// After a failure, keep the error on screen for a moment before retrying automatically.
@@ -50,6 +57,14 @@ final class MirrorSession {
     private var timer: Timer?
 
     // MARK: - Lifecycle
+
+    init() {
+        frameSink.onSizeChange = { size in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self.frameSizeChanged(size) }
+            }
+        }
+    }
 
     func start() {
         ScreenCaptureDevices.enable()
@@ -90,6 +105,50 @@ final class MirrorSession {
         retryNotBefore = nil
         if activeDevice != nil { disconnect() }
         evaluate()
+    }
+
+    var lowLatency: Bool { Settings.lowLatency }
+
+    /// Low-Latency Mode: frames go through `FrameSink` and are shown the instant they arrive.
+    /// Off: the standard `AVCaptureVideoPreviewLayer`, kept so the two can be compared.
+    func setLowLatency(_ on: Bool) {
+        guard on != Settings.lowLatency else { return }
+        Settings.lowLatency = on
+        guard currentInput != nil else {
+            publishRenderState() // nothing on screen yet; the next connection uses the new mode
+            return
+        }
+        // Switch without a blank moment: keep the current picture up until the other path
+        // has a fresh frame. (The iPad only sends frames when its screen changes.)
+        let attempt = generation
+        if on {
+            frameSink.notifyOnNextFrame {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        if attempt == self.generation, Settings.lowLatency { self.publishRenderState() }
+                    }
+                }
+            }
+            applyVideoOutput()
+        } else {
+            onRenderStateChange?(true, true) // standard preview attached underneath, low-latency still on top
+            refreshVideoSize()
+            frameSink.notifyOnNextFrame(after: 0.3) { // give the preview time to connect
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        if attempt == self.generation, !Settings.lowLatency {
+                            self.publishRenderState()
+                            self.applyVideoOutput() // now remove the low-latency output
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tells the window to show the picture path for the current setting.
+    private func publishRenderState() {
+        onRenderStateChange?(!Settings.lowLatency, Settings.lowLatency)
     }
 
     var playsAudio: Bool { Settings.playsAudio }
@@ -193,28 +252,51 @@ final class MirrorSession {
         let attempt = generation
         activeDevice = device
         currentInput = nil
+        pendingFrameSize = nil
         videoSize = nil
         Settings.lastDeviceID = device.uniqueID
         state = .connecting(deviceName: device.localizedName)
 
         let session = self.session
         let withAudio = wantsAudio
+        let sink = Settings.lowLatency ? frameSink : nil
         sessionQueue.async {
-            let result = Self.configure(session, with: device, audio: withAudio)
+            let (result, videoOutputAdded) = Self.configure(session, with: device, audio: withAudio, frameSink: sink)
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
-                    self.finishConnecting(attempt: attempt, device: device, result: result)
+                    self.finishConnecting(
+                        attempt: attempt,
+                        device: device,
+                        result: result,
+                        usedFrameSink: sink != nil,
+                        videoOutputAdded: videoOutputAdded
+                    )
                 }
             }
         }
     }
 
-    private func finishConnecting(attempt: Int, device: AVCaptureDevice, result: Result<AVCaptureDeviceInput, Error>) {
+    private func finishConnecting(
+        attempt: Int,
+        device: AVCaptureDevice,
+        result: Result<AVCaptureDeviceInput, Error>,
+        usedFrameSink: Bool,
+        videoOutputAdded: Bool
+    ) {
         guard attempt == generation else { return } // a newer connect/disconnect happened meanwhile
         switch result {
         case .success(let input):
             currentInput = input
             state = .live(deviceName: device.localizedName)
+            if usedFrameSink && !videoOutputAdded {
+                lowLatencyUnavailable()
+            } else if usedFrameSink != Settings.lowLatency {
+                applyVideoOutput() // Low-Latency Mode was toggled while connecting
+            }
+            if Settings.lowLatency, let size = pendingFrameSize {
+                videoSize = size
+            }
+            pendingFrameSize = nil
             refreshVideoSize()
         case .failure(let error):
             fail(with: error.localizedDescription)
@@ -231,16 +313,57 @@ final class MirrorSession {
         generation += 1
         activeDevice = nil
         currentInput = nil
+        pendingFrameSize = nil
         videoSize = nil
+        frameSink.reset()
+        publishRenderState() // drop any half-finished mode switch
         let session = self.session
         sessionQueue.async { Self.teardown(session) }
     }
 
+    /// Adds the low-latency video output if Low-Latency Mode is on, removes it if it's off.
+    private func applyVideoOutput() {
+        guard currentInput != nil else { return } // applied on the next connect instead
+        let session = self.session
+        let on = Settings.lowLatency
+        let sink = on ? frameSink : nil
+        let attempt = generation
+        sessionQueue.async {
+            let added = Self.setVideoOutput(sink, in: session)
+            if on && !added {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        if attempt == self.generation { self.lowLatencyUnavailable() }
+                    }
+                }
+            }
+        }
+    }
+
+    /// If the session refuses the video data output, fall back to the standard picture path.
+    private func lowLatencyUnavailable() {
+        NSLog("iPad Live: Low-Latency Mode isn't available for this device; using the standard picture path.")
+        guard Settings.lowLatency else { return }
+        Settings.lowLatency = false
+        publishRenderState()
+        refreshVideoSize()
+    }
+
     // MARK: - Video size (changes when the iPad rotates)
 
+    /// Low-Latency Mode reads the size from the frames themselves (see `frameSizeChanged`).
     private func refreshVideoSize() {
-        guard let input = currentInput else { return }
+        guard !Settings.lowLatency, let input = currentInput else { return }
         if let size = Self.videoSize(of: input) {
+            videoSize = size
+        }
+    }
+
+    private func frameSizeChanged(_ size: CGSize) {
+        guard Settings.lowLatency, activeDevice != nil else { return } // stale frame after unplugging
+        if currentInput == nil {
+            pendingFrameSize = size // first frames can beat the "connected" callback
+        } else {
             videoSize = size
         }
     }
@@ -309,16 +432,19 @@ final class MirrorSession {
 
     // MARK: - Capture session work (runs on sessionQueue)
 
+    /// Returns the connection result, and whether the low-latency video output was added.
     nonisolated private static func configure(
         _ session: AVCaptureSession,
         with device: AVCaptureDevice,
-        audio: Bool
-    ) -> Result<AVCaptureDeviceInput, Error> {
+        audio: Bool,
+        frameSink: FrameSink?
+    ) -> (Result<AVCaptureDeviceInput, Error>, Bool) {
         session.beginConfiguration()
         for input in session.inputs { session.removeInput(input) }
         for output in session.outputs { session.removeOutput(output) }
 
         let result: Result<AVCaptureDeviceInput, Error>
+        var videoOutputAdded = false
         do {
             let input = try AVCaptureDeviceInput(device: device)
             guard session.canAddInput(input) else {
@@ -327,6 +453,7 @@ final class MirrorSession {
                 )
             }
             session.addInput(input)
+            if let frameSink { videoOutputAdded = addVideoOutput(to: session, sink: frameSink) }
             if audio { addAudioOutput(to: session) }
             result = .success(input)
         } catch {
@@ -337,7 +464,7 @@ final class MirrorSession {
         if case .success = result, !session.isRunning {
             session.startRunning() // blocks until frames start flowing, hence the background queue
         }
-        return result
+        return (result, videoOutputAdded)
     }
 
     nonisolated private static func teardown(_ session: AVCaptureSession) {
@@ -357,6 +484,26 @@ final class MirrorSession {
             existing.forEach { session.removeOutput($0) }
         }
         session.commitConfiguration()
+    }
+
+    /// Adds or removes the low-latency video output on a running session.
+    nonisolated private static func setVideoOutput(_ sink: FrameSink?, in session: AVCaptureSession) -> Bool {
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+        for output in session.outputs where output is AVCaptureVideoDataOutput {
+            session.removeOutput(output)
+        }
+        guard let sink else { return true }
+        return addVideoOutput(to: session, sink: sink)
+    }
+
+    nonisolated private static func addVideoOutput(to session: AVCaptureSession, sink: FrameSink) -> Bool {
+        let output = AVCaptureVideoDataOutput()
+        output.alwaysDiscardsLateVideoFrames = true // newest frame wins; never build up a backlog
+        output.setSampleBufferDelegate(sink, queue: sink.queue)
+        guard session.canAddOutput(output) else { return false }
+        session.addOutput(output)
+        return true
     }
 
     /// Plays the iPad's sound through the Mac's current output device.

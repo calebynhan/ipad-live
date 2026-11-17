@@ -34,6 +34,7 @@ enum Settings {
         static let floatOnTop = "floatOnTop"
         static let playsAudio = "playsAudio"
         static let background = "background"
+        static let lowLatency = "lowLatency"
     }
 
     static func registerDefaults() {
@@ -43,6 +44,7 @@ enum Settings {
             Key.floatOnTop: false,
             Key.playsAudio: false,
             Key.background: BackgroundStyle.black.rawValue,
+            Key.lowLatency: true,
         ])
     }
 
@@ -72,6 +74,12 @@ enum Settings {
     static var playsAudio: Bool {
         get { defaults.bool(forKey: Key.playsAudio) }
         set { defaults.set(newValue, forKey: Key.playsAudio) }
+    }
+
+    /// Show each frame the instant it arrives (see FrameSink). Off = Apple's standard preview layer.
+    static var lowLatency: Bool {
+        get { defaults.bool(forKey: Key.lowLatency) }
+        set { defaults.set(newValue, forKey: Key.lowLatency) }
     }
 
     static var background: BackgroundStyle {

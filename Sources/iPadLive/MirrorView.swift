@@ -4,13 +4,17 @@ import iPadLiveCore
 
 /// Shows the live iPad picture.
 ///
-/// It uses `AVCaptureVideoPreviewLayer`, which hands frames from the capture device straight to
-/// the window server on the GPU: no copying, no re-encoding. That's the lowest-latency way to put
-/// a capture device on screen on macOS. The preview layer sits inside a clipping layer so the
-/// iPad's status bar can be trimmed off.
+/// There are two ways frames can reach the screen (only both briefly, while switching):
+/// - Low-Latency Mode (default): `FrameSink`'s `AVSampleBufferDisplayLayer`, which shows each
+///   frame the instant it arrives.
+/// - Standard: Apple's `AVCaptureVideoPreviewLayer`, kept so the two can be compared, and as a
+///   fallback.
+/// Both sit inside a clipping layer so the iPad's status bar can be trimmed off.
 final class MirrorView: NSView {
 
-    let previewLayer: AVCaptureVideoPreviewLayer
+    private let session: AVCaptureSession
+    private let displayLayer: AVSampleBufferDisplayLayer
+    private let previewLayer = AVCaptureVideoPreviewLayer()
     private let rootLayer = CALayer()
     private let clipLayer = CALayer()
 
@@ -27,8 +31,9 @@ final class MirrorView: NSView {
         didSet { rootLayer.backgroundColor = fillColor.cgColor }
     }
 
-    init(session: AVCaptureSession) {
-        previewLayer = AVCaptureVideoPreviewLayer(session: session)
+    init(session: AVCaptureSession, displayLayer: AVSampleBufferDisplayLayer) {
+        self.session = session
+        self.displayLayer = displayLayer
         super.init(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
 
         // Layer-hosting view: we own the layer tree, AppKit just keeps the root sized to the view.
@@ -44,13 +49,30 @@ final class MirrorView: NSView {
         previewLayer.backgroundColor = NSColor.black.cgColor
 
         clipLayer.addSublayer(previewLayer)
+        clipLayer.addSublayer(displayLayer) // added last, so it draws on top
         rootLayer.addSublayer(clipLayer)
+        setRenderState(previewAttached: false, showsLowLatencyLayer: true)
         updateLayerFrames()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not used")
+    }
+
+    /// `previewAttached`: connect Apple's standard preview layer to the capture session (it sits
+    /// underneath). It's only attached while needed, so the two paths don't both process frames.
+    /// `showsLowLatencyLayer`: show Low-Latency Mode's layer, on top.
+    func setRenderState(previewAttached: Bool, showsLowLatencyLayer: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        previewLayer.isHidden = !previewAttached
+        displayLayer.isHidden = !showsLowLatencyLayer
+        CATransaction.commit()
+        let wanted: AVCaptureSession? = previewAttached ? session : nil
+        if previewLayer.session !== wanted {
+            previewLayer.session = wanted
+        }
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -73,6 +95,7 @@ final class MirrorView: NSView {
         )
         clipLayer.frame = layout.clipFrame
         previewLayer.frame = layout.videoFrame
+        displayLayer.frame = layout.videoFrame
         CATransaction.commit()
     }
 }
