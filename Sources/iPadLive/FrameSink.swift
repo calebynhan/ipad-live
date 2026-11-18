@@ -26,6 +26,10 @@ final class FrameSink: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @
     private var framesSinceSizeReport = 0
     private var nextFrameCallback: (@Sendable () -> Void)?
     private var nextFrameNotBefore = DispatchTime.now()
+    private var acceptsExternal = false
+
+    /// Called (on `queue`) when the wireless stream needs a fresh keyframe to recover from a decode error.
+    var onExternalNeedsKeyframe: (@Sendable () -> Void)?
 
     override init() {
         let layer = AVSampleBufferDisplayLayer()
@@ -54,6 +58,31 @@ final class FrameSink: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @
         queue.async {
             self.nextFrameNotBefore = notBefore
             self.nextFrameCallback = callback
+        }
+    }
+
+    // MARK: - Wireless frames
+
+    /// Whether frames from the wireless stream are shown. Switching flushes the picture, so frames
+    /// from the cable and from Wi-Fi never mix.
+    func setAcceptsExternal(_ accepts: Bool) {
+        queue.async {
+            guard accepts != self.acceptsExternal else { return }
+            self.acceptsExternal = accepts
+            self.renderer.flush()
+        }
+    }
+
+    /// A compressed frame from the wireless stream; the display layer decodes it on the GPU.
+    func enqueueExternal(_ sampleBuffer: CMSampleBuffer) {
+        queue.async {
+            guard self.acceptsExternal else { return }
+            Self.markForImmediateDisplay(sampleBuffer)
+            if self.renderer.status == .failed || self.renderer.requiresFlushToResumeDecoding {
+                self.renderer.flush()
+                self.onExternalNeedsKeyframe?()
+            }
+            self.renderer.enqueue(sampleBuffer)
         }
     }
 

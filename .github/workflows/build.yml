@@ -67,3 +67,24 @@ jobs:
         with:
           name: iPad-Live
           path: build/iPad-Live.zip
+
+  ipad-app:
+    name: Build iPad app (unsigned)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate the Xcode project
+        run: cd iPadSender && xcodegen generate
+
+      - name: Build for iOS devices
+        run: |
+          set -euo pipefail
+          xcodebuild -project iPadSender/iPadLiveSender.xcodeproj -scheme iPadLiveSender \
+            -destination 'generic/platform=iOS' -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO -quiet build

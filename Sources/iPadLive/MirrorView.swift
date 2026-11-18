@@ -31,6 +31,12 @@ final class MirrorView: NSView {
         didSet { rootLayer.backgroundColor = fillColor.cgColor }
     }
 
+    /// Clockwise quarter turns applied to the low-latency layer. The wireless stream always arrives
+    /// in portrait plus a rotation; `videoSize` is the size after rotating.
+    var videoRotation = 0 {
+        didSet { if videoRotation != oldValue { updateLayerFrames() } }
+    }
+
     init(session: AVCaptureSession, displayLayer: AVSampleBufferDisplayLayer) {
         self.session = session
         self.displayLayer = displayLayer
@@ -94,8 +100,17 @@ final class MirrorView: NSView {
             hideStatusBar: hideStatusBar
         )
         clipLayer.frame = layout.clipFrame
-        previewLayer.frame = layout.videoFrame
-        displayLayer.frame = layout.videoFrame
+        let frame = layout.videoFrame
+        previewLayer.frame = frame
+        // Rotate the low-latency layer about its centre. CALayer angles are counterclockwise here.
+        let turns = ((videoRotation % 4) + 4) % 4
+        displayLayer.setAffineTransform(.identity)
+        displayLayer.bounds = CGRect(
+            origin: .zero,
+            size: turns % 2 == 1 ? CGSize(width: frame.height, height: frame.width) : frame.size
+        )
+        displayLayer.position = CGPoint(x: frame.midX, y: frame.midY)
+        displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: -CGFloat(turns) * .pi / 2))
         CATransaction.commit()
     }
 }

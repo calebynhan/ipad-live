@@ -1,6 +1,6 @@
 APP := build/iPad Live.app
 
-.PHONY: app run install test clean
+.PHONY: app run install test sender clean
 
 # Build build/iPad Live.app
 app:
@@ -19,6 +19,12 @@ install: app
 # Unit tests for the layout math (needs full Xcode, not just the Command Line Tools)
 test:
 	swift test
+
+# Generate the iPad app's Xcode project and open it (needs Xcode, and XcodeGen: brew install xcodegen)
+sender:
+	@command -v xcodegen >/dev/null 2>&1 || { echo "XcodeGen isn't installed. Run: brew install xcodegen"; exit 1; }
+	cd iPadSender && xcodegen generate
+	open iPadSender/iPadLiveSender.xcodeproj
 
 clean:
 	rm -rf .build build

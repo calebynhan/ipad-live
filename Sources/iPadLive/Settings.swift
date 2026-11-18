@@ -35,6 +35,9 @@ enum Settings {
         static let playsAudio = "playsAudio"
         static let background = "background"
         static let lowLatency = "lowLatency"
+        static let wirelessEnabled = "wirelessEnabled"
+        static let wirelessMacID = "wirelessMacID"
+        static let wirelessStreamKey = "wirelessStreamKey"
     }
 
     static func registerDefaults() {
@@ -45,6 +48,7 @@ enum Settings {
             Key.playsAudio: false,
             Key.background: BackgroundStyle.black.rawValue,
             Key.lowLatency: true,
+            Key.wirelessEnabled: true,
         ])
     }
 
@@ -80,6 +84,28 @@ enum Settings {
     static var lowLatency: Bool {
         get { defaults.bool(forKey: Key.lowLatency) }
         set { defaults.set(newValue, forKey: Key.lowLatency) }
+    }
+
+    /// Accept streams from paired iPads over Wi-Fi.
+    static var wirelessEnabled: Bool {
+        get { defaults.bool(forKey: Key.wirelessEnabled) }
+        set { defaults.set(newValue, forKey: Key.wirelessEnabled) }
+    }
+
+    /// This Mac's ID, advertised over Bonjour so a paired iPad finds the right Mac.
+    static var wirelessMacID: String {
+        if let id = defaults.string(forKey: Key.wirelessMacID) { return id }
+        let id = UUID().uuidString
+        defaults.set(id, forKey: Key.wirelessMacID)
+        return id
+    }
+
+    /// The secret paired iPads use to stream to this Mac. `nil` until the first pairing.
+    /// Kept in the app's preferences (readable only by your user account) rather than the keychain,
+    /// because a self-built app would trigger a keychain password prompt after every rebuild.
+    static var wirelessStreamKey: Data? {
+        get { defaults.data(forKey: Key.wirelessStreamKey) }
+        set { defaults.set(newValue, forKey: Key.wirelessStreamKey) }
     }
 
     static var background: BackgroundStyle {
