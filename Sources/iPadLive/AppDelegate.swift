@@ -47,6 +47,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         windowController.toggleHideStatusBar()
     }
 
+    @objc private func toggleLowLatency(_ sender: Any?) {
+        mirror.setLowLatency(!mirror.lowLatency)
+    }
+
     @objc private func toggleFloatOnTop(_ sender: Any?) {
         windowController.toggleFloatOnTop()
     }
@@ -90,6 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         • Turn on Do Not Disturb so notifications don't pop up while you share.
 
         On this Mac:
+        • View → Low-Latency Mode (⌘L) is on by default. It shows each frame the instant it arrives.
         • View → Hide iPad Status Bar trims the clock and battery off the top.
         • Double-click the picture for full screen. Drag anywhere to move the window.
         """
@@ -124,6 +129,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             menuItem.state = Settings.hideStatusBar ? .on : .off
         case #selector(toggleFloatOnTop(_:)):
             menuItem.state = Settings.floatOnTop ? .on : .off
+        case #selector(toggleLowLatency(_:)):
+            menuItem.state = mirror.lowLatency ? .on : .off
         case #selector(chooseBackground(_:)):
             menuItem.state = (menuItem.representedObject as? String) == Settings.background.rawValue ? .on : .off
         case #selector(chooseDevice(_:)):
@@ -191,6 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         addItem("Fit Window to iPad", #selector(fitWindowToIPad(_:)), key: "0", to: viewMenu)
         addItem("Keep iPad Shape", #selector(toggleLockAspectRatio(_:)), key: "", to: viewMenu)
         viewMenu.addItem(.separator())
+        addItem("Low-Latency Mode", #selector(toggleLowLatency(_:)), key: "l", to: viewMenu)
         addItem("Hide iPad Status Bar", #selector(toggleHideStatusBar(_:)), key: "b", to: viewMenu)
         let backgroundMenu = NSMenu(title: "Background")
         for style in BackgroundStyle.allCases {
