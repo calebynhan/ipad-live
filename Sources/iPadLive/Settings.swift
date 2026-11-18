@@ -1,4 +1,5 @@
 import AppKit
+import LiveLink
 
 /// The window background shown around the iPad picture.
 enum BackgroundStyle: String, CaseIterable {
@@ -37,7 +38,7 @@ enum Settings {
         static let lowLatency = "lowLatency"
         static let wirelessEnabled = "wirelessEnabled"
         static let wirelessMacID = "wirelessMacID"
-        static let wirelessStreamKey = "wirelessStreamKey"
+        static let wirelessDevices = "wirelessDevices"
     }
 
     static func registerDefaults() {
@@ -100,12 +101,18 @@ enum Settings {
         return id
     }
 
-    /// The secret paired iPads use to stream to this Mac. `nil` until the first pairing.
+    /// Paired iPads, each with its own stream key (new at every pairing).
     /// Kept in the app's preferences (readable only by your user account) rather than the keychain,
     /// because a self-built app would trigger a keychain password prompt after every rebuild.
-    static var wirelessStreamKey: Data? {
-        get { defaults.data(forKey: Key.wirelessStreamKey) }
-        set { defaults.set(newValue, forKey: Key.wirelessStreamKey) }
+    static var wirelessDevices: [PairedDevice] {
+        get {
+            guard let data = defaults.data(forKey: Key.wirelessDevices) else { return [] }
+            return (try? JSONDecoder().decode([PairedDevice].self, from: data)) ?? []
+        }
+        set {
+            defaults.set(try? JSONEncoder().encode(newValue), forKey: Key.wirelessDevices)
+            defaults.removeObject(forKey: "wirelessStreamKey") // from the earlier single-key design
+        }
     }
 
     static var background: BackgroundStyle {

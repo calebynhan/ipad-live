@@ -38,6 +38,7 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
         }
         queue.sync {
             let client = LiveLinkStreamClient(
+                deviceID: mac.deviceID,
                 streamKey: mac.streamKey,
                 deviceName: mac.deviceName,
                 target: .bonjour(macID: mac.macID),

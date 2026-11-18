@@ -155,8 +155,9 @@ If Xcode says the bundle identifier isn't available, change `BUNDLE_ID_PREFIX` i
 
 ### Pair (once)
 
-1. On the Mac, in iPad Live, choose **Device → Pair iPad Wirelessly…**. It shows a 6-digit code.
-2. On the iPad, open **iPad Live Sender**. When asked, allow it to find devices on your local network. Tap your Mac and enter the code.
+1. On the Mac, in iPad Live, choose **Device → Pair iPad Wirelessly…**.
+2. On the iPad, open **iPad Live Sender**. When asked, allow it to find devices on your local network. Tap your Mac.
+3. Both screens now show a 6-digit code. **Check that they match**, then click **Pair** on the Mac and tap **Pair** on the iPad. If they don't match, cancel: something else on the network is trying to get in the middle.
 
 ### Stream
 
@@ -171,11 +172,16 @@ The first time it receives a stream, macOS may ask whether iPad Live can find de
 - Make sure both are on the same Wi-Fi network, and that **Device → Allow Wi-Fi Streaming** is ticked on the Mac.
 - Check **System Settings → Privacy & Security → Local Network** on the Mac and **Settings → Privacy & Security → Local Network** on the iPad. Both apps must be turned on.
 - Guest and school networks often block devices from seeing each other. A home network or personal hotspot works.
-- Pair again (Device → Pair iPad Wirelessly…) if you chose **Forget Paired iPads**, or reinstalled the iPad app.
+- Pair again (Device → Pair iPad Wirelessly…) if you chose **Forget Paired iPads**, or reinstalled or updated the iPad app from an older version.
 
 ### Security
 
-Streaming is encrypted, and only an iPad that has been paired can connect. The pairing code works once, only while the pairing window is open, and pairing stops after 5 wrong codes. Someone else on the same Wi-Fi can't watch your screen or push video into your window.
+Streaming is encrypted, and only an iPad you've paired can connect.
+
+- **Pairing** is "compare the codes", like pairing Bluetooth devices. Both screens show a code worked out from a fresh key exchange, and nothing is handed over until you confirm on both. Someone in the middle of the connection would cause the two screens to show different codes. There is no password involved that could be guessed or cracked later.
+- **Each iPad gets its own new 256-bit key** every time it pairs. Only that iPad and your Mac know it, and both ends must prove they have it.
+- **Every session uses fresh encryption keys** (TLS with ECDHE-PSK only), so recorded traffic can't be decrypted later.
+- The pairing listener only runs while the pairing window is open, handles one iPad at a time, and stops as soon as an iPad is paired.
 
 Without the companion app, macOS also has wireless mirroring built in: on the iPad, open **Control Center → Screen Mirroring** and choose your Mac. It shows full screen rather than in the iPad Live window, with more delay.
 
@@ -187,7 +193,7 @@ Without the companion app, macOS also has wireless mirroring built in: on the iP
 - `MirrorView.swift` holds the picture: Low-Latency Mode's display layer, or Apple's `AVCaptureVideoPreviewLayer` when the mode is off. A clipping layer trims the status bar.
 - `MirrorWindowController.swift` is the chrome-free window: it reshapes on rotation, hides its buttons when the pointer leaves, and hides the pointer when it rests over the picture.
 - `Sources/iPadLiveCore` holds the layout math, with unit tests (`make test`, needs full Xcode).
-- **Wi-Fi:** `Sources/LiveLink` is shared by the Mac app and the iPad app. It holds the message format, TLS-PSK security (a pairing code, then a 256-bit stream key, with ECDHE for fresh keys each session), the low-latency H.264 encoder, and the network code. The iPad's broadcast extension (`iPadSender/Broadcast`) encodes only the newest screen frame and skips frames rather than queueing them. The Mac's `WirelessController` hands received frames to the same instant-display layer as Low-Latency Mode. The tests (`Tests/LiveLinkTests`) pair, stream and decode real video over a loopback connection.
+- **Wi-Fi:** `Sources/LiveLink` is shared by the Mac app and the iPad app. It holds the message format, numeric-comparison pairing (`PairingCrypto.swift`: X25519 with a commitment, then a confirmed code on both screens), per-iPad 256-bit stream keys used as TLS ECDHE-PSK keys, the low-latency H.264 encoder, and the network code. The iPad's broadcast extension (`iPadSender/Broadcast`) encodes only the newest screen frame and skips frames rather than queueing them. The Mac's `WirelessController` hands received frames to the same instant-display layer as Low-Latency Mode. The tests (`Tests/LiveLinkTests`) pair, stream and decode real video over a loopback connection. They also check that a man in the middle gets mismatched codes, that nothing is handed over until both sides confirm, and that each iPad's key is separate.
 
 ## Security
 

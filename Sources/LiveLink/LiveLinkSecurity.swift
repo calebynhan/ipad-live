@@ -3,67 +3,73 @@ import Foundation
 import Network
 import Security
 
+/// A paired iPad, as the Mac remembers it.
+public struct PairedDevice: Codable, Equatable, Sendable {
+    /// Random ID the Mac gave this iPad when pairing; the TLS PSK identity when it streams.
+    public var deviceID: String
+    public var name: String
+    /// 256-bit key known only to this Mac and this iPad. New for every pairing.
+    public var streamKey: Data
+
+    public init(deviceID: String, name: String, streamKey: Data) {
+        self.deviceID = deviceID
+        self.name = name
+        self.streamKey = streamKey
+    }
+}
+
 /// How LiveLink keeps strangers on the same Wi-Fi out.
 ///
-/// Every connection is TLS 1.2 with a pre-shared key (PSK), so the TLS handshake itself proves
-/// both ends know the key, and everything after it is encrypted:
-///
-/// - **Pairing** (once): the Mac shows a random 6-digit code; the iPad user types it in. Both sides
-///   derive a PSK from the code. The Mac's pairing listener only runs while its pairing window is
-///   open, and it gives up after a few wrong attempts.
-/// - **Streaming**: during pairing the Mac hands the iPad a random 256-bit stream key, which is the
-///   PSK for every streaming connection afterwards.
-///
-/// The ECDHE-PSK cipher suite is preferred so each session gets fresh keys (forward secrecy) and a
-/// passive eavesdropper can't attack the pairing code. Plain PSK-AES-GCM, the suite Apple's own
-/// peer-to-peer sample uses, is the fallback.
+/// - **Pairing** uses numeric comparison (`PairingCrypto`): both screens show a code derived from a
+///   fresh key exchange and the person confirms they match. Only then does the Mac hand this iPad
+///   its own new random 256-bit stream key, encrypted. There is no password to guess or crack.
+/// - **Streaming** is TLS 1.2 with ECDHE-PSK (`TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256`) only:
+///   the per-iPad stream key authenticates both ends (only that Mac and that iPad know it), and the
+///   ECDHE exchange gives every session fresh keys (forward secrecy). The PSK identity is the iPad's
+///   device ID, so the Mac uses the right key for each paired iPad.
 public enum LiveLinkSecurity {
 
-    /// A random 6-digit pairing code, e.g. "042917".
-    public static func makePairingCode() -> String {
-        var generator = SystemRandomNumberGenerator() // cryptographically secure on Apple platforms
-        return String(format: "%06d", Int.random(in: 0...999_999, using: &generator))
-    }
-
-    /// The PSK both sides derive from the pairing code. Spaces and dashes are ignored.
-    public static func pairingKey(code: String) -> Data {
-        let digits = code.filter(\.isNumber)
-        let key = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: SymmetricKey(data: Data(digits.utf8)),
-            salt: Data("ipad-live-pairing-v1".utf8),
-            info: Data("tls-psk".utf8),
-            outputByteCount: 32
-        )
-        return key.withUnsafeBytes { Data($0) }
-    }
+    /// The only cipher suite offered: ECDHE for forward secrecy, PSK for mutual authentication.
+    public static let cipherSuite: UInt16 = 0xCCAC // TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256 (RFC 7905)
 
     /// A new random 256-bit stream key.
     public static func makeStreamKey() -> Data {
         SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
     }
 
-    public static func streamParameters(streamKey: Data) -> NWParameters {
-        parameters(psk: streamKey, identity: LiveLink.streamPSKIdentity)
+    public static func makeDeviceID() -> String {
+        UUID().uuidString
     }
 
-    public static func pairingParameters(code: String) -> NWParameters {
-        parameters(psk: pairingKey(code: code), identity: LiveLink.pairingPSKIdentity)
+    /// iPad side: stream to the Mac as `deviceID`, proving it knows `streamKey`.
+    public static func streamClientParameters(deviceID: String, streamKey: Data) -> NWParameters {
+        tlsParameters(keys: [(deviceID, streamKey)])
     }
 
-    // TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256 (RFC 7905) and TLS_PSK_WITH_AES_128_GCM_SHA256 (RFC 5487).
-    static let ecdhePSKSuite: UInt16 = 0xCCAC
-    static let pskSuite: UInt16 = 0x00A8
+    /// Mac side: accept any paired iPad, each with its own key.
+    public static func streamServerParameters(devices: [PairedDevice]) -> NWParameters {
+        tlsParameters(keys: devices.map { ($0.deviceID, $0.streamKey) })
+    }
 
-    static func parameters(psk: Data, identity: String) -> NWParameters {
+    /// Pairing runs over plain TCP: `PairingCrypto` authenticates and encrypts what matters.
+    public static func pairingParameters() -> NWParameters {
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let parameters = NWParameters(tls: nil, tcp: tcp)
+        parameters.includePeerToPeer = false
+        return parameters
+    }
+
+    private static func tlsParameters(keys: [(identity: String, key: Data)]) -> NWParameters {
         let tls = NWProtocolTLS.Options()
         let options = tls.securityProtocolOptions
-        let pskData = psk.withUnsafeBytes { DispatchData(bytes: $0) }
-        let identityData = Data(identity.utf8).withUnsafeBytes { DispatchData(bytes: $0) }
-        sec_protocol_options_add_pre_shared_key(options, pskData as __DispatchData, identityData as __DispatchData)
-        for raw in [ecdhePSKSuite, pskSuite] {
-            let suite: tls_ciphersuite_t? = tls_ciphersuite_t(rawValue: raw)
-            if let suite { sec_protocol_options_append_tls_ciphersuite(options, suite) }
+        for (identity, key) in keys {
+            let keyData = key.withUnsafeBytes { DispatchData(bytes: $0) }
+            let identityData = Data(identity.utf8).withUnsafeBytes { DispatchData(bytes: $0) }
+            sec_protocol_options_add_pre_shared_key(options, keyData as __DispatchData, identityData as __DispatchData)
         }
+        let suite: tls_ciphersuite_t? = tls_ciphersuite_t(rawValue: cipherSuite)
+        if let suite { sec_protocol_options_append_tls_ciphersuite(options, suite) }
         // PSK cipher suites are TLS 1.2 features.
         sec_protocol_options_set_min_tls_protocol_version(options, .TLSv12)
         sec_protocol_options_set_max_tls_protocol_version(options, .TLSv12)

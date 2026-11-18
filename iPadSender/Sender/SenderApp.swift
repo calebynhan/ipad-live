@@ -17,12 +17,24 @@ struct SenderApp: App {
 /// Pairing state for the app's one screen.
 @MainActor
 final class SenderModel: ObservableObject {
+    /// Where pairing with a Mac has got to.
+    enum PairingStep: Equatable {
+        case idle
+        case connecting(macName: String)
+        /// Both screens show this code; the person checks they match.
+        case comparing(macName: String, code: String)
+        case waitingForMac(macName: String)
+    }
+
     @Published private(set) var pairedMac: PairedMac?
     @Published private(set) var nearbyMacs: [LiveLinkPairingBrowser.Mac] = []
-    @Published private(set) var isPairing = false
+    @Published private(set) var step: PairingStep = .idle
     @Published var statusMessage: String?
 
+    var isPairing: Bool { step != .idle }
+
     private let browser = LiveLinkPairingBrowser(queue: .main)
+    private var session: LiveLinkPairingSession?
 
     init() {
         pairedMac = PairedMacStore.load()
@@ -36,34 +48,60 @@ final class SenderModel: ObservableObject {
         browser.start()
     }
 
-    func pair(with mac: LiveLinkPairingBrowser.Mac, code: String) {
-        guard !isPairing else { return }
-        isPairing = true
+    /// Starts pairing: both screens will show a code to compare.
+    func pair(with mac: LiveLinkPairingBrowser.Mac) {
+        guard session == nil else { return }
         statusMessage = nil
+        step = .connecting(macName: mac.name)
         let deviceName = UIDevice.current.name
-        LiveLinkPairing.pair(with: mac.endpoint, code: code, deviceName: deviceName, queue: .main) { [weak self] result in
+        let session = LiveLinkPairingSession(endpoint: mac.endpoint, deviceName: deviceName, queue: .main)
+        session.onCode = { [weak self] code in
+            MainActor.assumeIsolated { self?.step = .comparing(macName: mac.name, code: code) }
+        }
+        session.onPaired = { [weak self] result in
+            MainActor.assumeIsolated { self?.finishPairing(result, deviceName: deviceName) }
+        }
+        session.onFailed = { [weak self] error in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.isPairing = false
-                switch result {
-                case .success(let pairing):
-                    let paired = PairedMac(
-                        macID: pairing.macID,
-                        macName: pairing.macName,
-                        streamKey: pairing.streamKey,
-                        deviceName: deviceName
-                    )
-                    do {
-                        try PairedMacStore.save(paired)
-                        self.pairedMac = paired
-                        self.statusMessage = "Paired with \(pairing.macName). Tap Start Streaming."
-                    } catch {
-                        self.statusMessage = error.localizedDescription
-                    }
-                case .failure(let error):
-                    self.statusMessage = error.localizedDescription
-                }
+                self.session = nil
+                self.step = .idle
+                self.statusMessage = error.localizedDescription
             }
+        }
+        self.session = session
+        session.start()
+    }
+
+    /// The person checked the codes match.
+    func confirmCode() {
+        guard case .comparing(let macName, _) = step else { return }
+        step = .waitingForMac(macName: macName)
+        session?.confirm()
+    }
+
+    func cancelPairing() {
+        session?.cancel()
+        session = nil
+        step = .idle
+    }
+
+    private func finishPairing(_ result: PairingCrypto.Result, deviceName: String) {
+        session = nil
+        step = .idle
+        let paired = PairedMac(
+            macID: result.macID,
+            macName: result.macName,
+            deviceID: result.deviceID,
+            streamKey: result.streamKey,
+            deviceName: deviceName
+        )
+        do {
+            try PairedMacStore.save(paired)
+            pairedMac = paired
+            statusMessage = "Paired with \(result.macName). Tap Start Streaming."
+        } catch {
+            statusMessage = error.localizedDescription
         }
     }
 
@@ -76,8 +114,6 @@ final class SenderModel: ObservableObject {
 
 struct ContentView: View {
     @EnvironmentObject private var model: SenderModel
-    @State private var macToPair: LiveLinkPairingBrowser.Mac?
-    @State private var code = ""
 
     var body: some View {
         NavigationStack {
@@ -118,15 +154,21 @@ struct ContentView: View {
                     }
                     ForEach(model.nearbyMacs) { mac in
                         Button {
-                            code = ""
-                            macToPair = mac
+                            model.pair(with: mac)
                         } label: {
                             Label(mac.name, systemImage: "desktopcomputer")
                         }
                         .disabled(model.isPairing)
                     }
-                    if model.isPairing {
-                        ProgressView("Pairing…")
+                    switch model.step {
+                    case .idle:
+                        EmptyView()
+                    case .connecting(let macName):
+                        ProgressView("Connecting to \(macName)…")
+                    case .comparing:
+                        Text("Check the code on both screens.")
+                    case .waitingForMac(let macName):
+                        ProgressView("Now click Pair on \(macName).")
                     }
                     if let message = model.statusMessage {
                         Text(message).font(.callout)
@@ -146,23 +188,27 @@ struct ContentView: View {
             .navigationTitle("iPad Live Sender")
         }
         .onAppear { model.startBrowsing() }
-        .alert("Enter Pairing Code", isPresented: isAskingForCode) {
-            TextField("123 456", text: $code)
-                .keyboardType(.numberPad)
-            Button("Pair") {
-                if let mac = macToPair { model.pair(with: mac, code: code) }
-                macToPair = nil
-            }
-            Button("Cancel", role: .cancel) { macToPair = nil }
+        .alert(comparisonTitle, isPresented: isComparingCodes) {
+            Button("Pair") { model.confirmCode() }
+            Button("Cancel", role: .cancel) { model.cancelPairing() }
         } message: {
-            Text("Enter the 6-digit code shown on \(macToPair?.name ?? "your Mac").")
+            Text("Check that your Mac shows the same code. If it does, tap Pair here and click Pair on the Mac. "
+                + "If it doesn't, tap Cancel: you may be connecting to the wrong device.")
         }
     }
 
-    private var isAskingForCode: Binding<Bool> {
+    private var comparisonTitle: String {
+        guard case .comparing(_, let code) = model.step else { return "" }
+        return "Code: \(code.prefix(3)) \(code.suffix(3))"
+    }
+
+    private var isComparingCodes: Binding<Bool> {
         Binding(
-            get: { macToPair != nil },
-            set: { if !$0 { macToPair = nil } }
+            get: {
+                if case .comparing = model.step { return true }
+                return false
+            },
+            set: { _ in } // dismissed only through the buttons
         )
     }
 

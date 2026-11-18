@@ -5,8 +5,8 @@ import VideoToolbox
 import XCTest
 @testable import LiveLink
 
-/// End-to-end checks of the wireless pipeline on a Mac: message format, TLS-PSK pairing and
-/// streaming over a real loopback connection, and real H.264 encode → network → decode.
+/// End-to-end checks of the wireless pipeline on a Mac: message format, numeric-comparison
+/// pairing, TLS-PSK streaming over a real loopback connection, and real H.264 encode → network → decode.
 final class LiveLinkTests: XCTestCase {
 
     // MARK: - Message format
@@ -14,7 +14,11 @@ final class LiveLinkTests: XCTestCase {
     func testEveryMessageRoundTrips() throws {
         let messages: [LiveLinkMessage] = [
             .hello(deviceName: "Caleb’s iPad 🖊"),
-            .pairAccepted(macID: "ABC-123", macName: "MacBook", streamKey: Data(repeating: 7, count: 32)),
+            .pairStart(deviceName: "iPad", publicKey: Data(repeating: 1, count: 32)),
+            .pairCommit(publicKey: Data(repeating: 2, count: 32), commitment: Data(repeating: 3, count: 32)),
+            .pairNonce(Data(repeating: 4, count: 32)),
+            .pairConfirm(sealed: Data([5, 6, 7])),
+            .pairResult(sealed: Data([8, 9])),
             .videoFormat(VideoFormat(codec: .h264, width: 1640, height: 2360, parameterSets: [Data([1, 2, 3]), Data([4, 5])])),
             .videoFrame(VideoFrame(isKeyframe: true, orientation: 6, presentationTimeMicros: -42, data: Data([9, 8, 7, 6]))),
             .videoFrame(VideoFrame(isKeyframe: false, orientation: 1, presentationTimeMicros: 1 << 40, data: Data([0]))),
@@ -46,15 +50,7 @@ final class LiveLinkTests: XCTestCase {
         XCTAssertNil(try LiveLinkMessage.decode(type: 200, payload: Data([1, 2, 3])))
     }
 
-    // MARK: - Keys
-
-    func testPairingCodes() {
-        let code = LiveLinkSecurity.makePairingCode()
-        XCTAssertEqual(code.count, 6)
-        XCTAssertTrue(code.allSatisfy(\.isNumber))
-        XCTAssertEqual(LiveLinkSecurity.pairingKey(code: "123 456"), LiveLinkSecurity.pairingKey(code: "123456"))
-        XCTAssertNotEqual(LiveLinkSecurity.pairingKey(code: "123456"), LiveLinkSecurity.pairingKey(code: "123457"))
-        XCTAssertEqual(LiveLinkSecurity.pairingKey(code: "123456").count, 32)
+    func testStreamKeys() {
         XCTAssertEqual(LiveLinkSecurity.makeStreamKey().count, 32)
         XCTAssertNotEqual(LiveLinkSecurity.makeStreamKey(), LiveLinkSecurity.makeStreamKey())
     }
@@ -66,59 +62,143 @@ final class LiveLinkTests: XCTestCase {
         XCTAssertEqual(VideoOrientation.clockwiseQuarterTurns(forOrientation: 8), 3)
     }
 
-    // MARK: - Pairing over loopback
+    // MARK: - Pairing crypto (numeric comparison)
 
-    func testPairingWithTheRightCodeHandsOverTheStreamKey() throws {
-        let streamKey = LiveLinkSecurity.makeStreamKey()
-        let server = LiveLinkPairingServer(code: "482913", macID: "mac-1", macName: "Test Mac", streamKey: streamKey, advertise: false)
-        let port = try listen(server)
-        defer { server.stop() }
+    func testPairingExchangeAgreesOnTheCodeAndDeliversTheKey() throws {
+        var iPad = PairingInitiator()
+        var mac = try PairingResponder(initiatorKey: iPad.publicKey)
+        let iPadNonce = try iPad.receiveCommit(responderKey: mac.publicKey, commitment: mac.commitment)
+        let (macNonce, macCode) = try mac.receiveNonce(iPadNonce)
+        let iPadCode = try iPad.receiveNonce(macNonce)
+        XCTAssertEqual(iPadCode, macCode)
+        XCTAssertEqual(iPadCode.count, 6)
+        XCTAssertTrue(iPadCode.allSatisfy(\.isNumber))
 
-        let paired = expectation(description: "server saw the pairing")
-        server.onPaired = { name in
-            XCTAssertEqual(name, "Test iPad")
-            paired.fulfill()
-        }
-        let result = expectation(description: "iPad got the key")
-        LiveLinkPairing.pair(with: loopback(port), code: "482 913", deviceName: "Test iPad", queue: DispatchQueue(label: "pair")) { outcome in
-            switch outcome {
-            case .success(let pairing):
-                XCTAssertEqual(pairing, LiveLinkPairing.Result(macID: "mac-1", macName: "Test Mac", streamKey: streamKey))
-            case .failure(let error):
-                XCTFail("pairing failed: \(error)")
-            }
-            result.fulfill()
-        }
-        wait(for: [paired, result], timeout: 15)
+        XCTAssertTrue(mac.openConfirmation(try iPad.sealConfirmation()))
+        let result = PairingCrypto.Result(macID: "mac", macName: "Mac", deviceID: "dev", streamKey: LiveLinkSecurity.makeStreamKey())
+        XCTAssertEqual(try iPad.openResult(try mac.sealResult(result)), result)
     }
 
-    func testPairingWithTheWrongCodeFails() throws {
-        let server = LiveLinkPairingServer(code: "482913", macID: "mac-1", macName: "Test Mac", streamKey: LiveLinkSecurity.makeStreamKey(), advertise: false)
+    func testIPadRejectsANonceThatDoesNotMatchTheCommitment() throws {
+        var iPad = PairingInitiator()
+        let mac = try PairingResponder(initiatorKey: iPad.publicKey)
+        _ = try iPad.receiveCommit(responderKey: mac.publicKey, commitment: mac.commitment)
+        // Someone trying to steer the code by changing the nonce after committing:
+        XCTAssertThrowsError(try iPad.receiveNonce(Data(repeating: 9, count: 32)))
+    }
+
+    func testAManInTheMiddleGetsMismatchedCodesAndCannotReadTheResult() throws {
+        // The attacker runs one exchange with the iPad (posing as the Mac) and one with the Mac
+        // (posing as the iPad). Each screen shows the code from a different exchange.
+        var iPad = PairingInitiator()
+        var fakeMac = try PairingResponder(initiatorKey: iPad.publicKey)
+        let n1 = try iPad.receiveCommit(responderKey: fakeMac.publicKey, commitment: fakeMac.commitment)
+        let (fakeMacNonce, _) = try fakeMac.receiveNonce(n1)
+        let iPadCode = try iPad.receiveNonce(fakeMacNonce)
+
+        var fakeIPad = PairingInitiator()
+        var mac = try PairingResponder(initiatorKey: fakeIPad.publicKey)
+        let n2 = try fakeIPad.receiveCommit(responderKey: mac.publicKey, commitment: mac.commitment)
+        let (macNonce, macCode) = try mac.receiveNonce(n2)
+        _ = try fakeIPad.receiveNonce(macNonce)
+
+        // Codes match only by chance (1 in a million); with these fresh random values they won't.
+        XCTAssertNotEqual(iPadCode, macCode)
+        // The real Mac's result is sealed to its own exchange: the iPad's keys can't open it.
+        let result = PairingCrypto.Result(macID: "mac", macName: "Mac", deviceID: "dev", streamKey: LiveLinkSecurity.makeStreamKey())
+        XCTAssertThrowsError(try iPad.openResult(try mac.sealResult(result)))
+        // And the iPad's confirmation means nothing to the real Mac.
+        XCTAssertFalse(mac.openConfirmation(try iPad.sealConfirmation()))
+    }
+
+    // MARK: - Pairing over loopback
+
+    func testPairingCompletesOnlyAfterBothSidesConfirm() throws {
+        let server = LiveLinkPairingServer(macID: "mac-1", macName: "Test Mac", advertise: false)
         let port = try listen(server)
         defer { server.stop() }
 
+        let macCode = Locked<String?>(nil)
+        let requested = expectation(description: "Mac shows the request")
+        server.onRequest = { name, code in
+            XCTAssertEqual(name, "Test iPad")
+            macCode.set(code)
+            requested.fulfill()
+        }
+        let macPaired = Locked<PairedDevice?>(nil)
+        let paired = expectation(description: "Mac paired")
+        server.onPaired = { device in
+            macPaired.set(device)
+            paired.fulfill()
+        }
+
+        let session = LiveLinkPairingSession(endpoint: loopback(port), deviceName: "Test iPad", queue: DispatchQueue(label: "pair"))
+        let iPadCode = Locked<String?>(nil)
+        let codeShown = expectation(description: "iPad shows the code")
+        session.onCode = { code in
+            iPadCode.set(code)
+            codeShown.fulfill()
+        }
+        let iPadResult = Locked<PairingCrypto.Result?>(nil)
+        let iPadPaired = expectation(description: "iPad paired")
+        session.onPaired = { result in
+            iPadResult.set(result)
+            iPadPaired.fulfill()
+        }
+        session.onFailed = { XCTFail("pairing failed: \($0)") }
+        session.start()
+
+        wait(for: [requested, codeShown], timeout: 15)
+        XCTAssertEqual(macCode.get(), iPadCode.get())
+
+        // Only the iPad confirms: nothing is handed over yet.
+        let notYet = expectation(description: "not paired before the Mac confirms")
+        notYet.isInverted = true
+        server.onPaired = { _ in notYet.fulfill() }
+        session.confirm()
+        wait(for: [notYet], timeout: 1)
+
+        // The Mac confirms too: now both get the same fresh key.
+        server.onPaired = { device in
+            macPaired.set(device)
+            paired.fulfill()
+        }
+        server.confirm()
+        wait(for: [paired, iPadPaired], timeout: 15)
+
+        let device = try XCTUnwrap(macPaired.get())
+        let result = try XCTUnwrap(iPadResult.get())
+        XCTAssertEqual(result.macID, "mac-1")
+        XCTAssertEqual(result.macName, "Test Mac")
+        XCTAssertEqual(result.deviceID, device.deviceID)
+        XCTAssertEqual(result.streamKey, device.streamKey)
+        XCTAssertEqual(device.streamKey.count, 32)
+    }
+
+    func testMacDecliningFailsThePairing() throws {
+        let server = LiveLinkPairingServer(macID: "mac-1", macName: "Test Mac", advertise: false)
+        let port = try listen(server)
+        defer { server.stop() }
+        server.onRequest = { _, _ in server.decline() }
         let notPaired = expectation(description: "never paired")
         notPaired.isInverted = true
         server.onPaired = { _ in notPaired.fulfill() }
-        let counted = expectation(description: "failed attempt counted")
-        server.onFailedAttempt = { count in
-            XCTAssertEqual(count, 1)
-            counted.fulfill()
-        }
-        let result = expectation(description: "iPad was refused")
-        LiveLinkPairing.pair(with: loopback(port), code: "111111", deviceName: "Intruder", queue: DispatchQueue(label: "pair")) { outcome in
-            if case .success = outcome { XCTFail("paired with the wrong code") }
-            result.fulfill()
-        }
-        wait(for: [result, counted], timeout: 15)
+
+        let session = LiveLinkPairingSession(endpoint: loopback(port), deviceName: "Test iPad", queue: DispatchQueue(label: "pair"))
+        let failed = expectation(description: "iPad told pairing failed")
+        session.onCode = { _ in session.confirm() }
+        session.onPaired = { _ in XCTFail("paired after the Mac declined") }
+        session.onFailed = { _ in failed.fulfill() }
+        session.start()
+        wait(for: [failed], timeout: 15)
         wait(for: [notPaired], timeout: 1)
     }
 
     // MARK: - Streaming over loopback
 
     func testStreamWithTheRightKeyConnectsBothWays() throws {
-        let key = LiveLinkSecurity.makeStreamKey()
-        let server = LiveLinkStreamServer(streamKey: key, macID: nil)
+        let device = PairedDevice(deviceID: "dev-1", name: "Test iPad", streamKey: LiveLinkSecurity.makeStreamKey())
+        let server = LiveLinkStreamServer(devices: [device], macID: nil)
         let port = try listen(server)
         defer { server.stop() }
 
@@ -129,7 +209,10 @@ final class LiveLinkTests: XCTestCase {
             server.send(.requestKeyframe)
         }
         let queue = DispatchQueue(label: "client")
-        let client = LiveLinkStreamClient(streamKey: key, deviceName: "Test iPad", target: .endpoint(loopback(port)), queue: queue)
+        let client = LiveLinkStreamClient(
+            deviceID: device.deviceID, streamKey: device.streamKey, deviceName: "Test iPad",
+            target: .endpoint(loopback(port)), queue: queue
+        )
         defer { client.stop() }
         let control = expectation(description: "iPad received a command")
         client.onControl = { command in
@@ -140,15 +223,37 @@ final class LiveLinkTests: XCTestCase {
         client.onReady = {
             let suite = client.negotiatedCipherSuite
             print("LiveLink negotiated TLS cipher suite: \(suite.map { String(format: "0x%04X", $0) } ?? "unknown")")
-            XCTAssertTrue(suite == LiveLinkSecurity.ecdhePSKSuite || suite == LiveLinkSecurity.pskSuite)
+            XCTAssertEqual(suite, LiveLinkSecurity.cipherSuite, "streaming must use ECDHE-PSK")
             ready.fulfill()
         }
         client.start()
         wait(for: [ready, started, control], timeout: 15)
     }
 
+    func testEachPairedIPadUsesItsOwnKey() throws {
+        let first = PairedDevice(deviceID: "dev-1", name: "iPad 1", streamKey: LiveLinkSecurity.makeStreamKey())
+        let second = PairedDevice(deviceID: "dev-2", name: "iPad 2", streamKey: LiveLinkSecurity.makeStreamKey())
+        let server = LiveLinkStreamServer(devices: [first, second], macID: nil)
+        let port = try listen(server)
+        defer { server.stop() }
+
+        let started = expectation(description: "second iPad streams")
+        server.onStreamStarted = { name in
+            if name == "iPad 2" { started.fulfill() }
+        }
+        let client = LiveLinkStreamClient(
+            deviceID: second.deviceID, streamKey: second.streamKey, deviceName: "iPad 2",
+            target: .endpoint(loopback(port)), queue: DispatchQueue(label: "client")
+        )
+        defer { client.stop() }
+        client.start()
+        wait(for: [started], timeout: 15)
+    }
+
     func testStreamWithTheWrongKeyIsRefused() throws {
-        let server = LiveLinkStreamServer(streamKey: LiveLinkSecurity.makeStreamKey(), macID: nil)
+        let device = PairedDevice(deviceID: "dev-1", name: "Test iPad", streamKey: LiveLinkSecurity.makeStreamKey())
+        let other = PairedDevice(deviceID: "dev-2", name: "Other iPad", streamKey: LiveLinkSecurity.makeStreamKey())
+        let server = LiveLinkStreamServer(devices: [device, other], macID: nil)
         let port = try listen(server)
         defer { server.stop() }
 
@@ -156,26 +261,31 @@ final class LiveLinkTests: XCTestCase {
         notStarted.isInverted = true
         server.onStreamStarted = { _ in notStarted.fulfill() }
 
-        let client = LiveLinkStreamClient(
-            streamKey: LiveLinkSecurity.makeStreamKey(),
-            deviceName: "Intruder",
-            target: .endpoint(loopback(port)),
-            queue: DispatchQueue(label: "client")
-        )
-        let refused = expectation(description: "client disconnected")
-        refused.assertForOverFulfill = false
-        client.onDisconnected = { _ in refused.fulfill() }
-        client.start()
-        wait(for: [refused], timeout: 15)
-        client.stop()
+        // A paired device's ID with another device's key, and an unknown device: both refused.
+        let attempts: [(String, Data)] = [
+            (device.deviceID, other.streamKey),
+            ("intruder", LiveLinkSecurity.makeStreamKey()),
+        ]
+        for (deviceID, key) in attempts {
+            let client = LiveLinkStreamClient(
+                deviceID: deviceID, streamKey: key, deviceName: "Intruder",
+                target: .endpoint(loopback(port)), queue: DispatchQueue(label: "client")
+            )
+            let refused = expectation(description: "refused \(deviceID)")
+            refused.assertForOverFulfill = false
+            client.onDisconnected = { _ in refused.fulfill() }
+            client.start()
+            wait(for: [refused], timeout: 15)
+            client.stop()
+        }
         wait(for: [notStarted], timeout: 1)
     }
 
     // MARK: - Real video: encode → send → receive → decode
 
     func testEncodedVideoArrivesDecodable() throws {
-        let key = LiveLinkSecurity.makeStreamKey()
-        let server = LiveLinkStreamServer(streamKey: key, macID: nil)
+        let device = PairedDevice(deviceID: "dev-1", name: "Test iPad", streamKey: LiveLinkSecurity.makeStreamKey())
+        let server = LiveLinkStreamServer(devices: [device], macID: nil)
         let port = try listen(server)
         defer { server.stop() }
 
@@ -188,7 +298,10 @@ final class LiveLinkTests: XCTestCase {
         }
 
         let queue = DispatchQueue(label: "client")
-        let client = LiveLinkStreamClient(streamKey: key, deviceName: "Test iPad", target: .endpoint(loopback(port)), queue: queue)
+        let client = LiveLinkStreamClient(
+            deviceID: device.deviceID, streamKey: device.streamKey, deviceName: "Test iPad",
+            target: .endpoint(loopback(port)), queue: queue
+        )
         defer { client.stop() }
         let ready = expectation(description: "client ready")
         client.onReady = { ready.fulfill() }

@@ -4,8 +4,8 @@ import Network
 
 /// Mac side: accepts the paired iPad's stream and turns it into `CMSampleBuffer`s.
 ///
-/// Only devices that know the stream key get past the TLS handshake. One stream at a time: a new
-/// stream (e.g. the iPad restarted its broadcast) replaces the old one.
+/// Only paired iPads, each with its own stream key, get past the TLS handshake. One stream at a
+/// time: a new stream (e.g. the iPad restarted its broadcast) replaces the old one.
 /// All callbacks arrive on `queue`.
 public final class LiveLinkStreamServer: @unchecked Sendable {
 
@@ -27,9 +27,10 @@ public final class LiveLinkStreamServer: @unchecked Sendable {
     private var assembler = SampleBufferAssembler()
     private var lastInfo: (width: Int, height: Int, orientation: UInt8)?
 
+    /// - Parameter devices: the paired iPads; each authenticates with its own key.
     /// - Parameter macID: advertised over Bonjour so paired iPads can find this Mac; `nil` to not advertise.
-    public init(streamKey: Data, macID: String?, port: NWEndpoint.Port = .any) {
-        parameters = LiveLinkSecurity.streamParameters(streamKey: streamKey)
+    public init(devices: [PairedDevice], macID: String?, port: NWEndpoint.Port = .any) {
+        parameters = LiveLinkSecurity.streamServerParameters(devices: devices)
         self.port = port
         service = macID.map {
             NWListener.Service(type: LiveLink.streamServiceType, txtRecord: NWTXTRecord([LiveLink.macIDKey: $0]))
@@ -130,50 +131,65 @@ public final class LiveLinkStreamServer: @unchecked Sendable {
             if let sampleBuffer = assembler.sampleBuffer(for: frame) {
                 onFrame?(sampleBuffer)
             }
-        case .pairAccepted, .control:
-            break // not sent by iPads
+        default:
+            break // control and pairing messages don't belong on a stream connection
         }
     }
 }
 
-/// Mac side: hands the stream key to an iPad that knows the pairing code.
+/// Mac side: pairs one iPad at a time by numeric comparison (see `PairingCrypto`).
 ///
-/// Runs only while the Mac's pairing window is open. All callbacks arrive on `queue`.
+/// Runs only while the Mac's pairing window is open, and stops for good once an iPad is paired.
+/// While one iPad is pairing, other connections are turned away. All callbacks arrive on `queue`;
+/// `confirm()` and `decline()` may be called from any thread.
 public final class LiveLinkPairingServer: @unchecked Sendable {
 
     public let queue = DispatchQueue(label: "app.ipadlive.wireless.pairing")
 
     public var onListening: ((NWEndpoint.Port) -> Void)?
     public var onListenerFailed: ((Error) -> Void)?
-    public var onPaired: ((_ deviceName: String) -> Void)?
-    /// A connection failed before pairing, almost always a wrong code. Includes the running count.
-    public var onFailedAttempt: ((_ count: Int) -> Void)?
+    /// An iPad wants to pair: show its name and the code, and ask the person to check the iPad shows
+    /// the same code before calling `confirm()`.
+    public var onRequest: ((_ deviceName: String, _ code: String) -> Void)?
+    /// Both sides confirmed. The device (with its new stream key) should be remembered.
+    public var onPaired: ((PairedDevice) -> Void)?
+    /// The pairing in progress ended without pairing (the iPad cancelled or left). The listener
+    /// keeps running so the iPad can try again.
+    public var onRequestEnded: (() -> Void)?
 
-    private let parameters: NWParameters
     private let service: NWListener.Service?
     private let port: NWEndpoint.Port
     private let macID: String
     private let macName: String
-    private let streamKey: Data
     private var listener: NWListener?
-    private var connections: [LiveLinkConnection] = []
-    private var failedAttempts = 0
-    private var paired = false
+    private var session: Session?
+    private var finished = false
 
-    public init(code: String, macID: String, macName: String, streamKey: Data, advertise: Bool, port: NWEndpoint.Port = .any) {
-        parameters = LiveLinkSecurity.pairingParameters(code: code)
+    private final class Session {
+        let connection: LiveLinkConnection
+        var deviceName = ""
+        var responder: PairingResponder?
+        var macConfirmed = false
+        var iPadConfirmed = false
+        var announced = false
+
+        init(connection: LiveLinkConnection) {
+            self.connection = connection
+        }
+    }
+
+    public init(macID: String, macName: String, advertise: Bool, port: NWEndpoint.Port = .any) {
         self.port = port
         self.macID = macID
         self.macName = macName
-        self.streamKey = streamKey
         service = advertise ? NWListener.Service(type: LiveLink.pairingServiceType) : nil
     }
 
     public func start() {
         queue.async {
-            guard self.listener == nil else { return }
+            guard self.listener == nil, !self.finished else { return }
             do {
-                let listener = try NWListener(using: self.parameters, on: self.port)
+                let listener = try NWListener(using: LiveLinkSecurity.pairingParameters(), on: self.port)
                 listener.service = self.service
                 listener.stateUpdateHandler = { [weak self] state in
                     guard let self else { return }
@@ -197,38 +213,98 @@ public final class LiveLinkPairingServer: @unchecked Sendable {
 
     public func stop() {
         queue.async {
+            self.finished = true
             self.listener?.cancel()
             self.listener = nil
-            self.connections.forEach { $0.cancel() }
-            self.connections.removeAll()
+            self.session?.connection.cancel()
+            self.session = nil
+        }
+    }
+
+    /// The person checked the codes match and clicked Pair on the Mac.
+    public func confirm() {
+        queue.async {
+            guard let session = self.session, session.announced else { return }
+            session.macConfirmed = true
+            self.finishIfConfirmed(session)
+        }
+    }
+
+    /// Turn down the iPad currently asking to pair. The listener keeps running.
+    public func decline() {
+        queue.async {
+            self.session?.connection.cancel()
         }
     }
 
     private func accept(_ nwConnection: NWConnection) {
-        guard !paired else {
-            nwConnection.cancel()
+        guard !finished, session == nil else {
+            nwConnection.cancel() // one pairing at a time
             return
         }
         let connection = LiveLinkConnection(connection: nwConnection, queue: queue)
-        var greeted = false
-        connection.onMessage = { [weak self, weak connection] message in
-            guard let self, let connection, case .hello(let deviceName) = message, !self.paired else { return }
-            greeted = true
-            self.paired = true
-            connection.send(.pairAccepted(macID: self.macID, macName: self.macName, streamKey: self.streamKey))
-            self.listener?.cancel() // the code is single-use
-            self.listener = nil
-            self.onPaired?(deviceName)
+        let session = Session(connection: connection)
+        connection.onMessage = { [weak self, weak session] message in
+            guard let self, let session else { return }
+            self.handle(message, in: session)
         }
-        connection.onClose = { [weak self, weak connection] error in
-            guard let self else { return }
-            self.connections.removeAll { $0 === connection }
-            if !greeted, error != nil, !self.paired {
-                self.failedAttempts += 1
-                self.onFailedAttempt?(self.failedAttempts)
-            }
+        connection.onClose = { [weak self, weak session] _ in
+            guard let self, let session, self.session === session else { return }
+            self.session = nil
+            if session.announced, !self.finished { self.onRequestEnded?() }
         }
-        connections.append(connection)
+        self.session = session
         connection.start()
+    }
+
+    private func handle(_ message: LiveLinkMessage, in session: Session) {
+        guard self.session === session, !finished else { return }
+        do {
+            switch message {
+            case .pairStart(let deviceName, let publicKey):
+                guard session.responder == nil else { throw LiveLinkError.pairingFailed }
+                let responder = try PairingResponder(initiatorKey: publicKey)
+                session.deviceName = String(deviceName.prefix(100))
+                session.responder = responder
+                session.connection.send(.pairCommit(publicKey: responder.publicKey, commitment: responder.commitment))
+            case .pairNonce(let initiatorNonce):
+                guard var responder = session.responder, responder.code == nil else { throw LiveLinkError.pairingFailed }
+                let (nonce, code) = try responder.receiveNonce(initiatorNonce)
+                session.responder = responder
+                session.connection.send(.pairNonce(nonce))
+                session.announced = true
+                onRequest?(session.deviceName, code)
+            case .pairConfirm(let sealed):
+                guard let responder = session.responder, responder.code != nil,
+                      responder.openConfirmation(sealed) else { throw LiveLinkError.pairingFailed }
+                session.iPadConfirmed = true
+                finishIfConfirmed(session)
+            default:
+                throw LiveLinkError.pairingFailed
+            }
+        } catch {
+            session.connection.cancel()
+        }
+    }
+
+    /// Hands over the stream key only once the person confirmed on both the Mac and the iPad.
+    private func finishIfConfirmed(_ session: Session) {
+        guard session.macConfirmed, session.iPadConfirmed, !finished, let responder = session.responder else { return }
+        let device = PairedDevice(
+            deviceID: LiveLinkSecurity.makeDeviceID(),
+            name: session.deviceName,
+            streamKey: LiveLinkSecurity.makeStreamKey()
+        )
+        let result = PairingCrypto.Result(macID: macID, macName: macName, deviceID: device.deviceID, streamKey: device.streamKey)
+        guard let sealed = try? responder.sealResult(result) else {
+            session.connection.cancel()
+            return
+        }
+        finished = true
+        listener?.cancel() // paired: no more pairing on this window
+        listener = nil
+        session.connection.send(.pairResult(sealed: sealed))
+        onPaired?(device)
+        // The iPad closes the connection once it has the result.
     }
 }

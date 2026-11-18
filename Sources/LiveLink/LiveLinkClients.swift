@@ -29,8 +29,8 @@ public final class LiveLinkStreamClient: @unchecked Sendable {
     private var connection: LiveLinkConnection?
     private var running = false
 
-    public init(streamKey: Data, deviceName: String, target: Target, queue: DispatchQueue) {
-        parameters = LiveLinkSecurity.streamParameters(streamKey: streamKey)
+    public init(deviceID: String, streamKey: Data, deviceName: String, target: Target, queue: DispatchQueue) {
+        parameters = LiveLinkSecurity.streamClientParameters(deviceID: deviceID, streamKey: streamKey)
         self.deviceName = deviceName
         self.target = target
         self.queue = queue
@@ -160,50 +160,94 @@ public final class LiveLinkPairingBrowser: @unchecked Sendable {
     }
 }
 
-/// iPad side: one pairing attempt with a Mac whose pairing window is open.
-public enum LiveLinkPairing {
+/// iPad side: one pairing attempt with a Mac whose pairing window is open, by numeric comparison
+/// (see `PairingCrypto`). Callbacks arrive on `queue`; call `confirm()` and `cancel()` from any thread.
+public final class LiveLinkPairingSession: @unchecked Sendable {
 
-    public struct Result: Equatable, Sendable {
-        public var macID: String
-        public var macName: String
-        public var streamKey: Data
-    }
+    /// Show this code and ask the person to check the Mac shows the same one, then call `confirm()`.
+    public var onCode: ((String) -> Void)?
+    /// Paired. Save the result (it holds this iPad's stream key) somewhere safe.
+    public var onPaired: ((PairingCrypto.Result) -> Void)?
+    /// Pairing ended without pairing. Called at most once, and never after `onPaired`.
+    public var onFailed: ((Error) -> Void)?
 
-    /// Calls `completion` exactly once, on `queue`.
-    public static func pair(
-        with endpoint: NWEndpoint,
-        code: String,
-        deviceName: String,
-        queue: DispatchQueue,
-        timeout: TimeInterval = 15,
-        completion: @escaping (Swift.Result<Result, Error>) -> Void
-    ) {
-        let connection = LiveLinkConnection(
-            connection: NWConnection(to: endpoint, using: LiveLinkSecurity.pairingParameters(code: code)),
+    private let queue: DispatchQueue
+    private let deviceName: String
+    private let connection: LiveLinkConnection
+    private var initiator = PairingInitiator()
+    private var confirmed = false
+    private var done = false
+
+    public init(endpoint: NWEndpoint, deviceName: String, queue: DispatchQueue, timeout: TimeInterval = 120) {
+        self.queue = queue
+        self.deviceName = deviceName
+        connection = LiveLinkConnection(
+            connection: NWConnection(to: endpoint, using: LiveLinkSecurity.pairingParameters()),
             queue: queue
         )
-        var finished = false
-        func finish(_ result: Swift.Result<Result, Error>) {
-            guard !finished else { return }
-            finished = true
-            connection.cancel()
-            completion(result)
+        connection.onReady = { [weak self] in
+            guard let self else { return }
+            self.connection.send(.pairStart(deviceName: self.deviceName, publicKey: self.initiator.publicKey))
         }
-        connection.onReady = { [weak connection] in
-            connection?.send(.hello(deviceName: deviceName))
+        connection.onMessage = { [weak self] message in self?.handle(message) }
+        connection.onClose = { [weak self] _ in
+            // A closed connection before the result means the Mac declined, or went away.
+            self?.fail(LiveLinkError.pairingDeclined)
         }
-        connection.onMessage = { message in
-            if case .pairAccepted(let macID, let macName, let streamKey) = message, streamKey.count == 32 {
-                finish(.success(Result(macID: macID, macName: macName, streamKey: streamKey)))
-            }
+        queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            self?.fail(LiveLinkError.timedOut)
         }
-        connection.onClose = { _ in
-            // A wrong code fails the TLS handshake, which lands here.
-            finish(.failure(LiveLinkError.pairingFailed))
-        }
-        queue.asyncAfter(deadline: .now() + timeout) {
-            finish(.failure(LiveLinkError.timedOut))
-        }
+    }
+
+    public func start() {
         connection.start()
+    }
+
+    /// The person checked the codes match and tapped Pair on the iPad.
+    public func confirm() {
+        queue.async {
+            guard !self.done, !self.confirmed, self.initiator.code != nil,
+                  let sealed = try? self.initiator.sealConfirmation() else { return }
+            self.confirmed = true
+            self.connection.send(.pairConfirm(sealed: sealed))
+        }
+    }
+
+    public func cancel() {
+        queue.async {
+            self.fail(LiveLinkError.pairingDeclined)
+        }
+    }
+
+    private func handle(_ message: LiveLinkMessage) {
+        guard !done else { return }
+        do {
+            switch message {
+            case .pairCommit(let publicKey, let commitment):
+                let nonce = try initiator.receiveCommit(responderKey: publicKey, commitment: commitment)
+                connection.send(.pairNonce(nonce))
+            case .pairNonce(let responderNonce):
+                let code = try initiator.receiveNonce(responderNonce)
+                onCode?(code)
+            case .pairResult(let sealed):
+                // Only accepted after this iPad's person confirmed.
+                guard confirmed else { throw LiveLinkError.pairingFailed }
+                let result = try initiator.openResult(sealed)
+                done = true
+                connection.cancel()
+                onPaired?(result)
+            default:
+                throw LiveLinkError.pairingFailed
+            }
+        } catch {
+            fail(error)
+        }
+    }
+
+    private func fail(_ error: Error) {
+        guard !done else { return }
+        done = true
+        connection.cancel()
+        onFailed?(error)
     }
 }

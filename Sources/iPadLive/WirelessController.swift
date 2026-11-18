@@ -2,16 +2,19 @@ import AppKit
 import LiveLink
 import SystemConfiguration
 
-/// The Mac end of Wi-Fi streaming: listens for the paired iPad (iPad Live Sender), runs pairing,
-/// and feeds received frames to the same instant-display path the cable's Low-Latency Mode uses.
+/// The Mac end of Wi-Fi streaming: listens for paired iPads (iPad Live Sender), runs pairing, and
+/// feeds received frames to the same instant-display path the cable's Low-Latency Mode uses.
 ///
 /// `MirrorSession` decides when Wi-Fi is the window's source (the cable always wins) via `setActive`.
 @MainActor
 final class WirelessController {
 
-    enum PairingOutcome: Sendable {
+    enum PairingEvent: Sendable {
+        /// An iPad asks to pair: show its name and code, and ask the person to compare with the iPad.
+        case request(deviceName: String, code: String)
+        /// The iPad asking to pair went away or cancelled; still waiting for one.
+        case requestEnded
         case paired(deviceName: String)
-        case tooManyAttempts
         case failed(String)
     }
 
@@ -22,12 +25,12 @@ final class WirelessController {
     var onVideoInfo: ((CGSize, Int) -> Void)?
 
     var isEnabled: Bool { Settings.wirelessEnabled }
-    var isPaired: Bool { Settings.wirelessStreamKey != nil }
+    var isPaired: Bool { !Settings.wirelessDevices.isEmpty }
 
     private let frameSink: FrameSink
     private var streamServer: LiveLinkStreamServer?
     private var pairingServer: LiveLinkPairingServer?
-    private var pairingHandler: ((PairingOutcome) -> Void)?
+    private var pairingHandler: ((PairingEvent) -> Void)?
     private var isActive = false
     private var isStreaming = false
 
@@ -65,57 +68,53 @@ final class WirelessController {
         if active { server.send(.requestKeyframe) }
     }
 
+    /// Every paired iPad loses access; each must pair again.
     func forgetPairedDevices() {
-        Settings.wirelessStreamKey = nil
+        Settings.wirelessDevices = []
         restartStreamServer()
     }
 
     // MARK: - Pairing
 
-    /// Opens pairing and returns the code to show. `onFinished` is called once on success, or if
-    /// pairing gives up; not if `cancelPairing()` is called first.
-    func beginPairing(onFinished: @escaping (PairingOutcome) -> Void) -> String {
+    /// Opens pairing. `onEvent` reports requests and the outcome; it isn't called after `cancelPairing()`.
+    func beginPairing(onEvent: @escaping (PairingEvent) -> Void) {
         cancelPairing()
-        if !Settings.wirelessEnabled { Settings.wirelessEnabled = true }
-        let streamKey: Data
-        if let existing = Settings.wirelessStreamKey {
-            streamKey = existing
-        } else {
-            streamKey = LiveLinkSecurity.makeStreamKey()
-            Settings.wirelessStreamKey = streamKey
+        if !Settings.wirelessEnabled {
+            Settings.wirelessEnabled = true
+            restartStreamServer()
         }
-        restartStreamServerIfNeeded()
 
-        let code = LiveLinkSecurity.makePairingCode()
-        let server = LiveLinkPairingServer(
-            code: code,
-            macID: Settings.wirelessMacID,
-            macName: Self.computerName,
-            streamKey: streamKey,
-            advertise: true
-        )
+        let server = LiveLinkPairingServer(macID: Settings.wirelessMacID, macName: Self.computerName, advertise: true)
         let serverID = ObjectIdentifier(server)
-        server.onPaired = { @Sendable name in
+        server.onRequest = { @Sendable name, code in
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self.finishPairing(serverID, .paired(deviceName: name)) }
+                MainActor.assumeIsolated { self.pairingEvent(serverID, .request(deviceName: name, code: code)) }
             }
         }
-        server.onFailedAttempt = { @Sendable count in
-            guard count >= 5 else { return } // a few typos are fine; guessing isn't
+        server.onRequestEnded = { @Sendable in
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self.finishPairing(serverID, .tooManyAttempts) }
+                MainActor.assumeIsolated { self.pairingEvent(serverID, .requestEnded) }
+            }
+        }
+        server.onPaired = { @Sendable device in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self.paired(device, serverID: serverID) }
             }
         }
         server.onListenerFailed = { @Sendable error in
             let message = error.localizedDescription
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self.finishPairing(serverID, .failed(message)) }
+                MainActor.assumeIsolated { self.pairingEvent(serverID, .failed(message)) }
             }
         }
         pairingServer = server
-        pairingHandler = onFinished
+        pairingHandler = onEvent
         server.start()
-        return code
+    }
+
+    /// The person checked the codes match and clicked Pair.
+    func confirmPairing() {
+        pairingServer?.confirm()
     }
 
     func cancelPairing() {
@@ -124,21 +123,25 @@ final class WirelessController {
         pairingHandler = nil
     }
 
-    private func finishPairing(_ serverID: ObjectIdentifier, _ outcome: PairingOutcome) {
+    private func paired(_ device: PairedDevice, serverID: ObjectIdentifier) {
         guard let server = pairingServer, ObjectIdentifier(server) == serverID else { return }
-        pairingServer = nil
+        Settings.wirelessDevices.append(device)
+        restartStreamServer() // the new iPad's key must be accepted
         let handler = pairingHandler
+        pairingServer = nil
         pairingHandler = nil
-        // Give the pairing reply a moment to reach the iPad before closing everything.
+        // Let the result reach the iPad before closing the connection.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { server.stop() }
-        handler?(outcome)
+        handler?(.paired(deviceName: device.name))
+    }
+
+    private func pairingEvent(_ serverID: ObjectIdentifier, _ event: PairingEvent) {
+        guard let server = pairingServer, ObjectIdentifier(server) == serverID else { return }
+        if case .failed = event { cancelPairing() }
+        pairingHandler?(event)
     }
 
     // MARK: - Streaming
-
-    private func restartStreamServerIfNeeded() {
-        if streamServer == nil { restartStreamServer() }
-    }
 
     private func restartStreamServer() {
         streamServer?.stop()
@@ -147,9 +150,10 @@ final class WirelessController {
             isStreaming = false
             onStreamEnded?()
         }
-        guard Settings.wirelessEnabled, let streamKey = Settings.wirelessStreamKey else { return }
+        let devices = Settings.wirelessDevices
+        guard Settings.wirelessEnabled, !devices.isEmpty else { return }
 
-        let server = LiveLinkStreamServer(streamKey: streamKey, macID: Settings.wirelessMacID)
+        let server = LiveLinkStreamServer(devices: devices, macID: Settings.wirelessMacID)
         let serverID = ObjectIdentifier(server)
         let sink = frameSink
         server.onFrame = { @Sendable sampleBuffer in

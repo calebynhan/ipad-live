@@ -6,7 +6,9 @@ import Security
 struct PairedMac: Codable, Equatable {
     var macID: String
     var macName: String
-    /// The secret only this iPad and that Mac know. Kept in the keychain, never in plain files.
+    /// This iPad's ID on that Mac.
+    var deviceID: String
+    /// This iPad's own key for that Mac, known only to the two of them. Kept in the keychain.
     var streamKey: Data
     /// What the Mac calls this iPad.
     var deviceName: String

@@ -5,6 +5,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     private var mirror: MirrorSession!
     private var windowController: MirrorWindowController!
+    private var pairingSheet: PairingSheet?
     private let deviceMenu = NSMenu(title: "Device")
     private let deviceItemTag = 1001
 
@@ -79,45 +80,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         windowController.showWindow(nil)
         guard let window = windowController.window, window.attachedSheet == nil else { return }
 
-        let alert = NSAlert()
-        let code = mirror.wireless.beginPairing { [weak self, weak alert] outcome in
+        let sheet = PairingSheet()
+        pairingSheet = sheet
+        sheet.onPair = { [weak self, weak sheet] in
+            self?.mirror.wireless.confirmPairing()
+            sheet?.showWaitingForIPad()
+        }
+        sheet.onCancel = { [weak self] in
+            self?.mirror.wireless.cancelPairing()
+            self?.closePairingSheet()
+        }
+        mirror.wireless.beginPairing { [weak self] event in
             guard let self else { return }
-            if let alert { window.endSheet(alert.window) }
-            // Let the code sheet finish closing before showing the result.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                MainActor.assumeIsolated { self.showPairingResult(outcome) }
+            switch event {
+            case .request(let deviceName, let code):
+                self.pairingSheet?.showCode(deviceName: deviceName, code: code)
+            case .requestEnded:
+                self.pairingSheet?.showWaiting(note: "The iPad stopped pairing.")
+            case .paired(let deviceName):
+                self.closePairingSheet()
+                self.showPairingAlert(
+                    title: "Paired with \(deviceName)",
+                    message: "To stream over Wi-Fi, open iPad Live Sender on your iPad and tap Start Streaming. "
+                        + "The cable still works too, and takes over whenever it's plugged in."
+                )
+            case .failed(let message):
+                self.closePairingSheet()
+                self.showPairingAlert(title: "Couldn't Start Pairing", message: message)
             }
         }
-        alert.messageText = "Pair an iPad"
-        alert.informativeText = "On your iPad, open iPad Live Sender, tap this Mac, and enter this code. "
-            + "Keep both devices on the same Wi-Fi."
-        let label = NSTextField(labelWithString: "\(code.prefix(3)) \(code.suffix(3))")
-        label.font = .monospacedDigitSystemFont(ofSize: 44, weight: .semibold)
-        label.alignment = .center
-        label.frame = NSRect(x: 0, y: 0, width: 280, height: 60)
-        alert.accessoryView = label
-        alert.addButton(withTitle: "Cancel")
-        alert.beginSheetModal(for: window) { [weak self] _ in
-            self?.mirror.wireless.cancelPairing()
-        }
+        sheet.showWaiting()
+        window.beginSheet(sheet.window)
     }
 
-    private func showPairingResult(_ outcome: WirelessController.PairingOutcome) {
-        guard let window = windowController.window, window.attachedSheet == nil else { return }
-        let alert = NSAlert()
-        switch outcome {
-        case .paired(let deviceName):
-            alert.messageText = "Paired with \(deviceName)"
-            alert.informativeText = "To stream over Wi-Fi, open iPad Live Sender on your iPad and tap Start Streaming. "
-                + "The cable still works too, and takes over whenever it's plugged in."
-        case .tooManyAttempts:
-            alert.messageText = "Pairing Stopped"
-            alert.informativeText = "Too many wrong codes were entered. Choose Device → Pair iPad Wirelessly to get a new code."
-        case .failed(let message):
-            alert.messageText = "Couldn't Start Pairing"
-            alert.informativeText = message
+    private func closePairingSheet() {
+        guard let sheet = pairingSheet else { return }
+        pairingSheet = nil
+        sheet.onPair = nil
+        sheet.onCancel = nil
+        windowController.window?.endSheet(sheet.window)
+    }
+
+    private func showPairingAlert(title: String, message: String) {
+        // Let the pairing sheet finish closing first.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            MainActor.assumeIsolated {
+                guard let window = self.windowController.window, window.attachedSheet == nil else { return }
+                let alert = NSAlert()
+                alert.messageText = title
+                alert.informativeText = message
+                alert.beginSheetModal(for: window)
+            }
         }
-        alert.beginSheetModal(for: window)
     }
 
     @objc private func toggleWireless(_ sender: Any?) {

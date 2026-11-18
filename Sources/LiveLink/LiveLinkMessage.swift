@@ -3,8 +3,9 @@ import Foundation
 /// LiveLink: how iPad Live Sender (on the iPad) streams its screen to iPad Live (on the Mac)
 /// over Wi-Fi. This file is shared by the Mac app and the iPad app.
 ///
-/// Every message on the wire is `[type: UInt8][payload length: UInt32, big-endian][payload]`,
-/// inside a TLS connection that only a paired iPad can open (see `LiveLinkSecurity`).
+/// Every message on the wire is `[type: UInt8][payload length: UInt32, big-endian][payload]`.
+/// Streaming runs inside TLS that only a paired iPad can open (see `LiveLinkSecurity`); pairing
+/// secures itself (see `PairingCrypto`).
 public enum LiveLink {
     /// Bonjour service the Mac advertises for streaming. Its TXT record carries the Mac's ID.
     public static let streamServiceType = "_ipadlive._tcp"
@@ -12,9 +13,6 @@ public enum LiveLink {
     public static let pairingServiceType = "_ipadlive-pair._tcp"
     /// TXT record key holding the Mac's ID, so a paired iPad finds the right Mac.
     public static let macIDKey = "id"
-
-    static let streamPSKIdentity = "ipad-live-stream-v1"
-    static let pairingPSKIdentity = "ipad-live-pair-v1"
 
     /// Largest payload accepted. A keyframe of a full-resolution iPad screen is well under this.
     public static let maxPayloadLength = 16 * 1024 * 1024
@@ -66,20 +64,34 @@ public enum ControlCommand: UInt8, Sendable {
 }
 
 public enum LiveLinkMessage: Equatable, Sendable {
-    /// First message from the iPad on every connection.
+    /// First message from the iPad on every stream connection.
     case hello(deviceName: String)
-    /// Mac → iPad during pairing: everything the iPad needs to stream to this Mac later.
-    case pairAccepted(macID: String, macName: String, streamKey: Data)
     case videoFormat(VideoFormat)
     case videoFrame(VideoFrame)
     case control(ControlCommand)
 
+    // Pairing (see `PairingCrypto` for what each step proves).
+    /// iPad → Mac: the iPad's one-time public key.
+    case pairStart(deviceName: String, publicKey: Data)
+    /// Mac → iPad: the Mac's one-time public key, and a commitment to its random nonce.
+    case pairCommit(publicKey: Data, commitment: Data)
+    /// Both directions: a random nonce (the iPad's first; then the Mac reveals its committed one).
+    case pairNonce(Data)
+    /// iPad → Mac, encrypted: the person tapped Pair after checking the codes match.
+    case pairConfirm(sealed: Data)
+    /// Mac → iPad, encrypted: everything the iPad needs to stream to this Mac.
+    case pairResult(sealed: Data)
+
     enum Kind: UInt8 {
         case hello = 1
-        case pairAccepted = 2
         case videoFormat = 3
         case videoFrame = 4
         case control = 5
+        case pairStart = 6
+        case pairCommit = 7
+        case pairNonce = 8
+        case pairConfirm = 9
+        case pairResult = 10
     }
 
     public static let headerLength = 5
@@ -105,11 +117,23 @@ public enum LiveLinkMessage: Equatable, Sendable {
         case .hello(let deviceName):
             kind = .hello
             payload.string(deviceName)
-        case .pairAccepted(let macID, let macName, let streamKey):
-            kind = .pairAccepted
-            payload.string(macID)
-            payload.string(macName)
-            payload.bytes(streamKey)
+        case .pairStart(let deviceName, let publicKey):
+            kind = .pairStart
+            payload.string(deviceName)
+            payload.bytes(publicKey)
+        case .pairCommit(let publicKey, let commitment):
+            kind = .pairCommit
+            payload.bytes(publicKey)
+            payload.bytes(commitment)
+        case .pairNonce(let nonce):
+            kind = .pairNonce
+            payload.bytes(nonce)
+        case .pairConfirm(let sealed):
+            kind = .pairConfirm
+            payload.bytes(sealed)
+        case .pairResult(let sealed):
+            kind = .pairResult
+            payload.bytes(sealed)
         case .videoFormat(let format):
             kind = .videoFormat
             payload.u8(format.codec.rawValue)
@@ -142,8 +166,16 @@ public enum LiveLinkMessage: Equatable, Sendable {
         switch kind {
         case .hello:
             message = .hello(deviceName: try reader.string())
-        case .pairAccepted:
-            message = .pairAccepted(macID: try reader.string(), macName: try reader.string(), streamKey: try reader.bytes())
+        case .pairStart:
+            message = .pairStart(deviceName: try reader.string(), publicKey: try reader.bytes())
+        case .pairCommit:
+            message = .pairCommit(publicKey: try reader.bytes(), commitment: try reader.bytes())
+        case .pairNonce:
+            message = .pairNonce(try reader.bytes())
+        case .pairConfirm:
+            message = .pairConfirm(sealed: try reader.bytes())
+        case .pairResult:
+            message = .pairResult(sealed: try reader.bytes())
         case .videoFormat:
             guard let codec = VideoCodec(rawValue: try reader.u8()) else { throw LiveLinkError.unsupportedCodec }
             let width = Int(try reader.u32())
@@ -178,6 +210,8 @@ public enum LiveLinkError: LocalizedError, Equatable {
     case unsupportedCodec
     case invalidVideoFormat
     case pairingFailed
+    case pairingDeclined
+    case pairingBusy
     case timedOut
 
     public var errorDescription: String? {
@@ -186,8 +220,10 @@ public enum LiveLinkError: LocalizedError, Equatable {
         case .messageTooLarge: return "The other device sent a message that was too large."
         case .unsupportedCodec: return "The iPad is using a video format this Mac doesn't understand."
         case .invalidVideoFormat: return "The iPad's video format couldn't be read."
-        case .pairingFailed: return "Pairing didn't work. Check the code on your Mac and try again."
-        case .timedOut: return "The Mac didn't answer. Make sure it's on the same Wi-Fi and its pairing window is open."
+        case .pairingFailed: return "Pairing didn't work. Try again while the Mac's Pair iPad Wirelessly window is open."
+        case .pairingDeclined: return "Pairing was cancelled."
+        case .pairingBusy: return "The Mac is already pairing with another device. Try again in a moment."
+        case .timedOut: return "Pairing timed out. Make sure the Mac's pairing window is open and both are on the same Wi-Fi."
         }
     }
 }
