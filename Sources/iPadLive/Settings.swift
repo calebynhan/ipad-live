@@ -1,4 +1,5 @@
 import AppKit
+import LiveLink
 
 /// The window background shown around the iPad picture.
 enum BackgroundStyle: String, CaseIterable {
@@ -35,6 +36,9 @@ enum Settings {
         static let playsAudio = "playsAudio"
         static let background = "background"
         static let lowLatency = "lowLatency"
+        static let wirelessEnabled = "wirelessEnabled"
+        static let wirelessMacID = "wirelessMacID"
+        static let wirelessDevices = "wirelessDevices"
     }
 
     static func registerDefaults() {
@@ -45,6 +49,7 @@ enum Settings {
             Key.playsAudio: false,
             Key.background: BackgroundStyle.black.rawValue,
             Key.lowLatency: true,
+            Key.wirelessEnabled: true,
         ])
     }
 
@@ -80,6 +85,34 @@ enum Settings {
     static var lowLatency: Bool {
         get { defaults.bool(forKey: Key.lowLatency) }
         set { defaults.set(newValue, forKey: Key.lowLatency) }
+    }
+
+    /// Accept streams from paired iPads over Wi-Fi.
+    static var wirelessEnabled: Bool {
+        get { defaults.bool(forKey: Key.wirelessEnabled) }
+        set { defaults.set(newValue, forKey: Key.wirelessEnabled) }
+    }
+
+    /// This Mac's ID, advertised over Bonjour so a paired iPad finds the right Mac.
+    static var wirelessMacID: String {
+        if let id = defaults.string(forKey: Key.wirelessMacID) { return id }
+        let id = UUID().uuidString
+        defaults.set(id, forKey: Key.wirelessMacID)
+        return id
+    }
+
+    /// Paired iPads, each with its own stream key (new at every pairing).
+    /// Kept in the app's preferences (readable only by your user account) rather than the keychain,
+    /// because a self-built app would trigger a keychain password prompt after every rebuild.
+    static var wirelessDevices: [PairedDevice] {
+        get {
+            guard let data = defaults.data(forKey: Key.wirelessDevices) else { return [] }
+            return (try? JSONDecoder().decode([PairedDevice].self, from: data)) ?? []
+        }
+        set {
+            defaults.set(try? JSONEncoder().encode(newValue), forKey: Key.wirelessDevices)
+            defaults.removeObject(forKey: "wirelessStreamKey") // from the earlier single-key design
+        }
     }
 
     static var background: BackgroundStyle {

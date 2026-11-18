@@ -1,10 +1,15 @@
 @preconcurrency import AVFoundation
 import CoreMedia
 
-/// Owns the capture session that pulls the iPad's screen over USB, and keeps it connected:
-/// it waits for an iPad, connects as soon as one appears, notices when it's unplugged,
-/// and retries after errors. All UI-facing state lives on the main thread; the capture
-/// session itself is configured on a background queue so the window never stutters.
+/// Decides what the window shows and keeps it connected.
+///
+/// The USB cable comes first: it has the least delay. When no iPad is plugged in, a paired iPad
+/// streaming over Wi-Fi (see `WirelessController`) is shown instead.
+///
+/// For the cable it owns the capture session: it waits for an iPad, connects as soon as one
+/// appears, notices when it's unplugged, and retries after errors. All UI-facing state lives on
+/// the main thread; the capture session itself is configured on a background queue so the
+/// window never stutters.
 @MainActor
 final class MirrorSession {
 
@@ -25,6 +30,8 @@ final class MirrorSession {
     /// Which picture path the window should show: `previewAttached` connects Apple's standard
     /// preview layer; `lowLatencyLayerVisible` shows Low-Latency Mode's layer (drawn on top).
     var onRenderStateChange: ((_ previewAttached: Bool, _ lowLatencyLayerVisible: Bool) -> Void)?
+    /// Clockwise quarter turns to apply to the low-latency layer (only Wi-Fi frames need it).
+    var onVideoRotationChange: ((Int) -> Void)?
 
     private(set) var state: State = .starting {
         didSet { if state != oldValue { onStateChange?(state) } }
@@ -35,12 +42,24 @@ final class MirrorSession {
         didSet { if videoSize != oldValue { onVideoSizeChange?(videoSize) } }
     }
 
+    private(set) var videoRotation = 0 {
+        didSet { if videoRotation != oldValue { onVideoRotationChange?(videoRotation) } }
+    }
+
     private(set) var devices: [AVCaptureDevice] = []
     private(set) var activeDevice: AVCaptureDevice?
 
     let session = AVCaptureSession()
-    /// Draws frames for Low-Latency Mode. Its layer lives in the window.
-    let frameSink = FrameSink()
+    /// Draws frames for Low-Latency Mode and Wi-Fi. Its layer lives in the window.
+    let frameSink: FrameSink
+    let wireless: WirelessController
+
+    // Wi-Fi
+    private var wirelessStreamName: String?
+    private var wirelessVideoSize: CGSize?
+    private var wirelessRotation = 0
+    /// Whether the window is currently showing the Wi-Fi stream.
+    private(set) var usingWireless = false
 
     private let sessionQueue = DispatchQueue(label: "app.ipadlive.capture-session", qos: .userInteractive)
     /// Created on first use, which is after `ScreenCaptureDevices.enable()` has run in `start()`.
@@ -59,6 +78,26 @@ final class MirrorSession {
     // MARK: - Lifecycle
 
     init() {
+        let sink = FrameSink()
+        frameSink = sink
+        wireless = WirelessController(frameSink: sink)
+        wireless.onStreamStarted = { name in
+            self.wirelessStreamName = name
+            self.evaluate()
+        }
+        wireless.onStreamEnded = {
+            self.wirelessStreamName = nil
+            self.wirelessVideoSize = nil
+            self.evaluate()
+        }
+        wireless.onVideoInfo = { size, turns in
+            self.wirelessVideoSize = size
+            self.wirelessRotation = turns
+            if self.usingWireless {
+                self.videoSize = size
+                self.videoRotation = turns
+            }
+        }
         frameSink.onSizeChange = { size in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { self.frameSizeChanged(size) }
@@ -78,6 +117,7 @@ final class MirrorSession {
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
 
+        wireless.start()
         evaluate()
     }
 
@@ -86,6 +126,7 @@ final class MirrorSession {
         timer = nil
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
+        wireless.stop()
         generation += 1
         let session = self.session
         sessionQueue.sync { Self.teardown(session) }
@@ -146,9 +187,13 @@ final class MirrorSession {
         }
     }
 
-    /// Tells the window to show the picture path for the current setting.
+    /// Tells the window which picture path to show. Wi-Fi always uses the low-latency layer.
     private func publishRenderState() {
-        onRenderStateChange?(!Settings.lowLatency, Settings.lowLatency)
+        if usingWireless {
+            onRenderStateChange?(false, true)
+        } else {
+            onRenderStateChange?(!Settings.lowLatency, Settings.lowLatency)
+        }
     }
 
     var playsAudio: Bool { Settings.playsAudio }
@@ -185,20 +230,13 @@ final class MirrorSession {
 
     /// Works out what should be happening right now and makes it so. Safe to call at any time.
     private func evaluate() {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized:
-            break
-        case .notDetermined:
-            state = .needsCameraPermission(denied: false)
-            requestCameraAccess()
-            return
-        default:
-            if activeDevice != nil { disconnect() }
-            state = .needsCameraPermission(denied: true)
-            return
-        }
+        // The cable needs Camera permission (macOS treats the iPad's screen as a camera); Wi-Fi doesn't.
+        let cameraStatus = AVCaptureDevice.authorizationStatus(for: .video)
+        if cameraStatus == .notDetermined { requestCameraAccess() }
+        let cableAllowed = cameraStatus == .authorized
+        if !cableAllowed, activeDevice != nil { disconnect() }
 
-        let found = ScreenCaptureDevices.connectedDevices(using: discovery)
+        let found = cableAllowed ? ScreenCaptureDevices.connectedDevices(using: discovery) : []
         if found.map(\.uniqueID) != devices.map(\.uniqueID) {
             devices = found
             retryNotBefore = nil // something was plugged in or out: worth trying again straight away
@@ -210,20 +248,53 @@ final class MirrorSession {
             disconnect() // unplugged
         }
 
-        if let notBefore = retryNotBefore, Date() < notBefore { return }
-        retryNotBefore = nil
+        let coolingDown = retryNotBefore.map { Date() < $0 } ?? false
+        if !coolingDown { retryNotBefore = nil }
 
-        if let device = preferredDevice(in: found) {
+        // The cable wins whenever an iPad is plugged in: it has the least delay.
+        if !coolingDown, let device = preferredDevice(in: found) {
+            stopUsingWireless()
             connect(to: device)
-        } else {
-            state = .waitingForDevice
+            return
         }
+        if let name = wirelessStreamName {
+            useWireless(deviceName: name)
+            return
+        }
+        stopUsingWireless()
+        if coolingDown { return } // keep the error on screen until the automatic retry
+
+        switch cameraStatus {
+        case .authorized: state = .waitingForDevice
+        case .notDetermined: state = .needsCameraPermission(denied: false)
+        default: state = .needsCameraPermission(denied: true)
+        }
+    }
+
+    private func useWireless(deviceName: String) {
+        if !usingWireless {
+            usingWireless = true
+            videoSize = wirelessVideoSize
+            videoRotation = wirelessRotation
+            wireless.setActive(true)
+            publishRenderState()
+        }
+        state = .live(deviceName: "\(deviceName) (Wi-Fi)")
+    }
+
+    private func stopUsingWireless() {
+        guard usingWireless else { return }
+        usingWireless = false
+        wireless.setActive(false)
+        videoRotation = 0
+        videoSize = nil
+        publishRenderState()
     }
 
     private func tick() {
         evaluate()
         refreshVideoSize()
-        if case .live = state, !session.isRunning {
+        if case .live = state, activeDevice != nil, !session.isRunning {
             fail(with: "The connection to your iPad was interrupted.")
         }
     }

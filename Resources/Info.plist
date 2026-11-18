@@ -30,6 +30,13 @@
 	<string>macOS treats a plugged-in iPad's screen like a camera. iPad Live needs this to show your iPad. Your Mac's own camera is never turned on.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>macOS treats a plugged-in iPad's sound like a microphone. iPad Live only uses this if you turn on "Play iPad Sound on This Mac". Your Mac's own microphone is never used.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>iPad Live uses your local network to receive your iPad's screen over Wi-Fi from iPad Live Sender.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_ipadlive._tcp</string>
+		<string>_ipadlive-pair._tcp</string>
+	</array>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>

@@ -43,6 +43,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
             self?.mirrorView.setRenderState(previewAttached: previewAttached, showsLowLatencyLayer: lowLatencyLayerVisible)
         }
         mirrorView.setRenderState(previewAttached: !Settings.lowLatency, showsLowLatencyLayer: Settings.lowLatency)
+        mirror.onVideoRotationChange = { [weak self] turns in self?.mirrorView.videoRotation = turns }
         render(mirror.state)
     }
 
@@ -126,11 +127,14 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
             ))
 
         case .waitingForDevice:
+            let wirelessHint = mirror.wireless.isPaired && mirror.wireless.isEnabled
+                ? "\n\nOr stream over Wi-Fi: open iPad Live Sender on your iPad and tap Start Streaming."
+                : ""
             overlay.show(.init(
                 symbolName: "cable.connector",
                 title: "Connect Your iPad",
                 message: "Plug your iPad into this Mac with a USB cable and unlock it.\n"
-                    + "If your iPad asks “Trust This Computer?”, tap Trust.",
+                    + "If your iPad asks “Trust This Computer?”, tap Trust." + wirelessHint,
                 showsSpinner: true
             ))
 

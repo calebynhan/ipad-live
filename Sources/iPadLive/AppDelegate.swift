@@ -5,6 +5,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     private var mirror: MirrorSession!
     private var windowController: MirrorWindowController!
+    private var pairingSheet: PairingSheet?
     private let deviceMenu = NSMenu(title: "Device")
     private let deviceItemTag = 1001
 
@@ -73,6 +74,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         mirror.setPlaysAudio(!mirror.playsAudio)
     }
 
+    // MARK: Wi-Fi
+
+    @objc private func pairWirelessly(_ sender: Any?) {
+        windowController.showWindow(nil)
+        guard let window = windowController.window, window.attachedSheet == nil else { return }
+
+        let sheet = PairingSheet()
+        pairingSheet = sheet
+        sheet.onPair = { [weak self, weak sheet] in
+            self?.mirror.wireless.confirmPairing()
+            sheet?.showWaitingForIPad()
+        }
+        sheet.onCancel = { [weak self] in
+            self?.mirror.wireless.cancelPairing()
+            self?.closePairingSheet()
+        }
+        mirror.wireless.beginPairing { [weak self] event in
+            guard let self else { return }
+            switch event {
+            case .request(let deviceName, let code):
+                self.pairingSheet?.showCode(deviceName: deviceName, code: code)
+            case .requestEnded:
+                self.pairingSheet?.showWaiting(note: "The iPad stopped pairing.")
+            case .paired(let deviceName):
+                self.closePairingSheet()
+                self.showPairingAlert(
+                    title: "Paired with \(deviceName)",
+                    message: "To stream over Wi-Fi, open iPad Live Sender on your iPad and tap Start Streaming. "
+                        + "The cable still works too, and takes over whenever it's plugged in."
+                )
+            case .failed(let message):
+                self.closePairingSheet()
+                self.showPairingAlert(title: "Couldn't Start Pairing", message: message)
+            }
+        }
+        sheet.showWaiting()
+        window.beginSheet(sheet.window)
+    }
+
+    private func closePairingSheet() {
+        guard let sheet = pairingSheet else { return }
+        pairingSheet = nil
+        sheet.onPair = nil
+        sheet.onCancel = nil
+        windowController.window?.endSheet(sheet.window)
+    }
+
+    private func showPairingAlert(title: String, message: String) {
+        // Let the pairing sheet finish closing first.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            MainActor.assumeIsolated {
+                guard let window = self.windowController.window, window.attachedSheet == nil else { return }
+                let alert = NSAlert()
+                alert.messageText = title
+                alert.informativeText = message
+                alert.beginSheetModal(for: window)
+            }
+        }
+    }
+
+    @objc private func toggleWireless(_ sender: Any?) {
+        mirror.wireless.setEnabled(!mirror.wireless.isEnabled)
+    }
+
+    @objc private func forgetWirelessDevices(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Forget Paired iPads?"
+        alert.informativeText = "iPads you've paired won't be able to stream to this Mac over Wi-Fi until you pair them again."
+        alert.addButton(withTitle: "Forget")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            mirror.wireless.forgetPairedDevices()
+        }
+    }
+
     @objc private func showWindow(_ sender: Any?) {
         windowController.showWindow(nil)
     }
@@ -89,7 +165,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         • FaceTime: Share Screen → Window, then click the iPad Live window.
 
         On your iPad:
-        • Use a cable. That's what makes it lag-free.
+        • Use a cable for the least delay. For Wi-Fi, pair once with Device → Pair iPad Wirelessly, \
+        then tap Start Streaming in iPad Live Sender. Plugging in the cable switches back to it.
         • Settings → Display & Brightness → Auto-Lock → Never, so the screen doesn't sleep.
         • Turn on Do Not Disturb so notifications don't pop up while you share.
 
@@ -137,6 +214,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             menuItem.state = (menuItem.representedObject as? String) == mirror.activeDevice?.uniqueID ? .on : .off
         case #selector(togglePlayAudio(_:)):
             menuItem.state = mirror.playsAudio ? .on : .off
+        case #selector(toggleWireless(_:)):
+            menuItem.state = mirror.wireless.isEnabled ? .on : .off
+        case #selector(forgetWirelessDevices(_:)):
+            return mirror.wireless.isPaired
         default:
             break
         }
@@ -221,6 +302,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         addItem("Reconnect", #selector(reconnect(_:)), key: "r", to: deviceMenu)
         deviceMenu.addItem(.separator())
         addItem("Play iPad Sound on This Mac", #selector(togglePlayAudio(_:)), key: "", to: deviceMenu)
+        deviceMenu.addItem(.separator())
+        addItem("Pair iPad Wirelessly…", #selector(pairWirelessly(_:)), key: "", to: deviceMenu)
+        addItem("Allow Wi-Fi Streaming", #selector(toggleWireless(_:)), key: "", to: deviceMenu)
+        addItem("Forget Paired iPads…", #selector(forgetWirelessDevices(_:)), key: "", to: deviceMenu)
         addSubmenu(deviceMenu, titled: "Device", to: mainMenu)
         rebuildDeviceItems()
 
