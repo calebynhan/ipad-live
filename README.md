@@ -87,7 +87,6 @@ You can also go full screen (double-click the picture) and share your whole scre
 | Float on top | ⌥⌘T |
 | Reconnect | ⌘R |
 | Pick an iPad (if several are plugged in) | **Device** menu |
-| Pair an iPad for Wi-Fi | **Device → Pair iPad Wirelessly…** |
 | Hear the iPad's sound on the Mac | **Device → Play iPad Sound on This Mac** |
 | Background colour around the picture | **View → Background** |
 
@@ -125,15 +124,27 @@ Other things that help:
 
 **What your audience sees:** Zoom, Meet and FaceTime add their own delay on top, usually more than this. Since you draw looking at the iPad, the iPad-to-Mac delay mostly matters if you watch the Mac window.
 
-## Wireless (Wi-Fi)
+## Experimental: Wi-Fi (off by default)
 
-iPad Live can also show your iPad over Wi-Fi, using a small companion app on the iPad, **iPad Live Sender**. The cable still has the least delay. Whenever an iPad is plugged in, iPad Live uses the cable and pauses Wi-Fi; unplug it and Wi-Fi takes over.
+iPad Live is cable-only out of the box: no Wi-Fi menus, and it doesn't use your network at all. The cable has the least delay and needs nothing installed on the iPad.
 
-Expect a little more delay than the cable, and more on busy Wi-Fi. A 5 GHz network with the iPad and Mac close to the router works best.
+There is also an experimental Wi-Fi mode, which uses a small companion app on the iPad, **iPad Live Sender**. It's switched off because installing the iPad app is a hassle:
+- **Download:** Xcode needs its iOS support download (about 9 GB) before it can install any app on an iPad.
+- **Weekly reinstall:** with a free Apple ID, the iPad app has to be reinstalled from Xcode every 7 days.
+
+To turn it on, run this, then quit and reopen iPad Live:
+
+```bash
+defaults write app.ipadlive.mirror wirelessFeature -bool true
+```
+
+To turn it back off, run `defaults delete app.ipadlive.mirror wirelessFeature` and quit and reopen the app.
+
+With Wi-Fi on, the cable still wins: whenever an iPad is plugged in, iPad Live uses the cable and pauses Wi-Fi. Unplug it and Wi-Fi takes over. Expect a little more delay than the cable, and more on busy Wi-Fi. A 5 GHz network with the iPad and Mac close to the router works best.
 
 ### What you need
 
-- **Xcode** (free, from the Mac App Store; a big download). The Command Line Tools alone can't build iPad apps.
+- **Xcode** (free, from the Mac App Store; a big download), plus its **iOS** support download (about 9 GB), which Xcode offers when you first choose an iPad. The Command Line Tools alone can't build iPad apps.
 - **Your Apple ID**, to install the app on your own iPad. A free Apple ID works, but iPadOS stops opening apps installed that way after **7 days**. Reinstall from Xcode (one click) when that happens. A paid Apple Developer account ($99/year) makes it last a year.
 - **XcodeGen**, which creates the Xcode project: `brew install xcodegen`
 
@@ -193,11 +204,11 @@ Without the companion app, macOS also has wireless mirroring built in: on the iP
 - `MirrorView.swift` holds the picture: Low-Latency Mode's display layer, or Apple's `AVCaptureVideoPreviewLayer` when the mode is off. A clipping layer trims the status bar.
 - `MirrorWindowController.swift` is the chrome-free window: it reshapes on rotation, hides its buttons when the pointer leaves, and hides the pointer when it rests over the picture.
 - `Sources/iPadLiveCore` holds the layout math, with unit tests (`make test`, needs full Xcode).
-- **Wi-Fi:** `Sources/LiveLink` is shared by the Mac app and the iPad app. It holds the message format, numeric-comparison pairing (`PairingCrypto.swift`: X25519 with a commitment, then a confirmed code on both screens), per-iPad 256-bit stream keys used as TLS ECDHE-PSK keys, the low-latency H.264 encoder, and the network code. The iPad's broadcast extension (`iPadSender/Broadcast`) encodes only the newest screen frame and skips frames rather than queueing them. The Mac's `WirelessController` hands received frames to the same instant-display layer as Low-Latency Mode. The tests (`Tests/LiveLinkTests`) pair, stream and decode real video over a loopback connection. They also check that a man in the middle gets mismatched codes, that nothing is handed over until both sides confirm, and that each iPad's key is separate.
+- **Wi-Fi (experimental, off by default):** `Sources/LiveLink` is shared by the Mac app and the iPad app. It holds the message format, numeric-comparison pairing (`PairingCrypto.swift`: X25519 with a commitment, then a confirmed code on both screens), per-iPad 256-bit stream keys used as TLS ECDHE-PSK keys, the low-latency H.264 encoder, and the network code. The iPad's broadcast extension (`iPadSender/Broadcast`) encodes only the newest screen frame and skips frames rather than queueing them. The Mac's `WirelessController` hands received frames to the same instant-display layer as Low-Latency Mode. The tests (`Tests/LiveLinkTests`) pair, stream and decode real video over a loopback connection. They also check that a man in the middle gets mismatched codes, that nothing is handed over until both sides confirm, and that each iPad's key is separate.
 
 ## Security
 
-- **Only what it needs:** iPad Live only opens plugged-in iPads and iPhones. It never turns on your Mac's own camera or microphone, and runs no other programs. Its only network activity is Wi-Fi streaming: it listens on your local network for your paired iPad (encrypted, paired devices only; see [Wireless → Security](#security)). Turn that off with **Device → Allow Wi-Fi Streaming**.
+- **Only what it needs:** iPad Live only opens plugged-in iPads and iPhones. It never turns on your Mac's own camera or microphone, and runs no other programs. It makes no network connections unless you turn on the experimental Wi-Fi feature. Even then it only accepts your paired iPad, and everything is encrypted (see [Wi-Fi → Security](#security)).
 - **Hardened runtime:** the app is signed with Apple's hardened runtime, which stops other software from injecting code into it and borrowing its camera permission. Its entitlements (`Resources/iPadLive.entitlements`) allow exactly two things: camera (the iPad's screen) and audio input (the iPad's sound).
 - **Sharing the app with others:** build with your Developer ID so it can be notarized by Apple: `SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" make app`
 - **CI:** the GitHub workflow has read-only access, pins each action to an exact commit, and checks that every build is signed with the hardened runtime and the two entitlements above.
@@ -212,8 +223,8 @@ Tests/iPadLiveCoreTests/      Tests for the layout math
 Resources/Info.plist          App info and permission messages
 Resources/AppIcon.icns        App icon
 Resources/iPadLive.entitlements  What the hardened runtime allows (camera + audio input)
-Sources/LiveLink/             Wi-Fi streaming protocol shared by the Mac and iPad apps
-iPadSender/                   The iPad app, iPad Live Sender (project.yml → make sender)
+Sources/LiveLink/             Experimental Wi-Fi streaming protocol, shared by the Mac and iPad apps
+iPadSender/                   Experimental iPad app, iPad Live Sender (project.yml → make sender)
 scripts/build-app.sh          Builds and signs build/iPad Live.app
 Makefile                      make app | run | install | test | clean
 ```

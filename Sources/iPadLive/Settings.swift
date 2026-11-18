@@ -36,6 +36,7 @@ enum Settings {
         static let playsAudio = "playsAudio"
         static let background = "background"
         static let lowLatency = "lowLatency"
+        static let wirelessFeature = "wirelessFeature"
         static let wirelessEnabled = "wirelessEnabled"
         static let wirelessMacID = "wirelessMacID"
         static let wirelessDevices = "wirelessDevices"
@@ -49,6 +50,7 @@ enum Settings {
             Key.playsAudio: false,
             Key.background: BackgroundStyle.black.rawValue,
             Key.lowLatency: true,
+            Key.wirelessFeature: false,
             Key.wirelessEnabled: true,
         ])
     }
@@ -87,7 +89,15 @@ enum Settings {
         set { defaults.set(newValue, forKey: Key.lowLatency) }
     }
 
-    /// Accept streams from paired iPads over Wi-Fi.
+    /// Experimental Wi-Fi streaming (needs the iPad Live Sender app on the iPad). Off by default:
+    /// iPad Live is cable-only, has no Wi-Fi menu items, and doesn't touch the network. Turn it on with
+    ///     defaults write app.ipadlive.mirror wirelessFeature -bool true
+    /// and relaunch the app.
+    static var wirelessFeature: Bool {
+        defaults.bool(forKey: Key.wirelessFeature)
+    }
+
+    /// With the Wi-Fi feature on: accept streams from paired iPads (Device → Allow Wi-Fi Streaming).
     static var wirelessEnabled: Bool {
         get { defaults.bool(forKey: Key.wirelessEnabled) }
         set { defaults.set(newValue, forKey: Key.wirelessEnabled) }

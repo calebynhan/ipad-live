@@ -127,7 +127,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate {
             ))
 
         case .waitingForDevice:
-            let wirelessHint = mirror.wireless.isPaired && mirror.wireless.isEnabled
+            let wirelessHint = mirror.wireless.isAvailable && mirror.wireless.isPaired && mirror.wireless.isEnabled
                 ? "\n\nOr stream over Wi-Fi: open iPad Live Sender on your iPad and tap Start Streaming."
                 : ""
             overlay.show(.init(
