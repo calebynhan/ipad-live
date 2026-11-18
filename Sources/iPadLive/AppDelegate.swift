@@ -156,6 +156,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     @objc private func showSharingTips(_ sender: Any?) {
         let alert = NSAlert()
         alert.messageText = "Tips for a Smooth Share"
+        let wifiTip = mirror.wireless.isAvailable
+            ? " For Wi-Fi, pair once with Device → Pair iPad Wirelessly, then tap Start Streaming in "
+                + "iPad Live Sender. Plugging in the cable switches back to it."
+            : ""
         alert.informativeText = """
         In your meeting app, share the “iPad Live” window (or your whole screen).
 
@@ -165,8 +169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         • FaceTime: Share Screen → Window, then click the iPad Live window.
 
         On your iPad:
-        • Use a cable for the least delay. For Wi-Fi, pair once with Device → Pair iPad Wirelessly, \
-        then tap Start Streaming in iPad Live Sender. Plugging in the cable switches back to it.
+        • Use a USB cable that carries data. That's what keeps it lag-free.\(wifiTip)
         • Settings → Display & Brightness → Auto-Lock → Never, so the screen doesn't sleep.
         • Turn on Do Not Disturb so notifications don't pop up while you share.
 
@@ -302,10 +305,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         addItem("Reconnect", #selector(reconnect(_:)), key: "r", to: deviceMenu)
         deviceMenu.addItem(.separator())
         addItem("Play iPad Sound on This Mac", #selector(togglePlayAudio(_:)), key: "", to: deviceMenu)
-        deviceMenu.addItem(.separator())
-        addItem("Pair iPad Wirelessly…", #selector(pairWirelessly(_:)), key: "", to: deviceMenu)
-        addItem("Allow Wi-Fi Streaming", #selector(toggleWireless(_:)), key: "", to: deviceMenu)
-        addItem("Forget Paired iPads…", #selector(forgetWirelessDevices(_:)), key: "", to: deviceMenu)
+        if mirror.wireless.isAvailable { // experimental; off by default (see Settings.wirelessFeature)
+            deviceMenu.addItem(.separator())
+            addItem("Pair iPad Wirelessly…", #selector(pairWirelessly(_:)), key: "", to: deviceMenu)
+            addItem("Allow Wi-Fi Streaming", #selector(toggleWireless(_:)), key: "", to: deviceMenu)
+            addItem("Forget Paired iPads…", #selector(forgetWirelessDevices(_:)), key: "", to: deviceMenu)
+        }
         addSubmenu(deviceMenu, titled: "Device", to: mainMenu)
         rebuildDeviceItems()
 

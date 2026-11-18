@@ -24,6 +24,8 @@ final class WirelessController {
     /// Displayed size (after rotation) and clockwise quarter turns.
     var onVideoInfo: ((CGSize, Int) -> Void)?
 
+    /// The experimental Wi-Fi feature is switched on (see `Settings.wirelessFeature`).
+    var isAvailable: Bool { Settings.wirelessFeature }
     var isEnabled: Bool { Settings.wirelessEnabled }
     var isPaired: Bool { !Settings.wirelessDevices.isEmpty }
 
@@ -79,6 +81,10 @@ final class WirelessController {
     /// Opens pairing. `onEvent` reports requests and the outcome; it isn't called after `cancelPairing()`.
     func beginPairing(onEvent: @escaping (PairingEvent) -> Void) {
         cancelPairing()
+        guard isAvailable else {
+            onEvent(.failed("Wi-Fi streaming is turned off."))
+            return
+        }
         if !Settings.wirelessEnabled {
             Settings.wirelessEnabled = true
             restartStreamServer()
@@ -151,7 +157,8 @@ final class WirelessController {
             onStreamEnded?()
         }
         let devices = Settings.wirelessDevices
-        guard Settings.wirelessEnabled, !devices.isEmpty else { return }
+        // Cable-only unless the experimental Wi-Fi feature is on: no listener, no network use at all.
+        guard isAvailable, Settings.wirelessEnabled, !devices.isEmpty else { return }
 
         let server = LiveLinkStreamServer(devices: devices, macID: Settings.wirelessMacID)
         let serverID = ObjectIdentifier(server)
