@@ -192,7 +192,7 @@ Streaming is encrypted, and only an iPad you've paired can connect.
 - **Pairing** is "compare the codes", like pairing Bluetooth devices. Both screens show a code worked out from a fresh key exchange, and nothing is handed over until you confirm on both. Someone in the middle of the connection would cause the two screens to show different codes. There is no password involved that could be guessed or cracked later.
 - **Each iPad gets its own new 256-bit key** every time it pairs. Only that iPad and your Mac know it, and both ends must prove they have it.
 - **Every session uses fresh encryption keys** (TLS with ECDHE-PSK only), so recorded traffic can't be decrypted later.
-- The pairing listener only runs while the pairing window is open, handles one iPad at a time, and stops as soon as an iPad is paired.
+- The pairing listener only runs while the pairing window is open, handles one iPad at a time, and stops as soon as an iPad is paired. A pairing that stalls is dropped: 15 seconds to get to the code, then 2 minutes to confirm. Clicking **Pair** on the Mac only ever applies to the request whose code is on screen.
 
 Without the companion app, macOS also has wireless mirroring built in: on the iPad, open **Control Center → Screen Mirroring** and choose your Mac. It shows full screen rather than in the iPad Live window, with more delay.
 
