@@ -137,11 +137,20 @@ public final class LiveLinkStreamServer: @unchecked Sendable {
     }
 }
 
+/// An iPad asking to pair, as shown to the person on the Mac.
+public struct PairingRequest: Equatable, Sendable {
+    /// Identifies this request. Confirming needs it, so a click only ever applies to the request on screen.
+    public let id: UUID
+    public let deviceName: String
+    public let code: String
+}
+
 /// Mac side: pairs one iPad at a time by numeric comparison (see `PairingCrypto`).
 ///
 /// Runs only while the Mac's pairing window is open, and stops for good once an iPad is paired.
-/// While one iPad is pairing, other connections are turned away. All callbacks arrive on `queue`;
-/// `confirm()` and `decline()` may be called from any thread.
+/// While one iPad is pairing, other connections are turned away, and a pairing that stalls is
+/// dropped after a time limit so it can't hold the window. All callbacks arrive on `queue`;
+/// `confirm(requestID:)` and `decline(requestID:)` may be called from any thread.
 public final class LiveLinkPairingServer: @unchecked Sendable {
 
     public let queue = DispatchQueue(label: "app.ipadlive.wireless.pairing")
@@ -149,23 +158,26 @@ public final class LiveLinkPairingServer: @unchecked Sendable {
     public var onListening: ((NWEndpoint.Port) -> Void)?
     public var onListenerFailed: ((Error) -> Void)?
     /// An iPad wants to pair: show its name and the code, and ask the person to check the iPad shows
-    /// the same code before calling `confirm()`.
-    public var onRequest: ((_ deviceName: String, _ code: String) -> Void)?
+    /// the same code before calling `confirm(requestID:)` with this request's ID.
+    public var onRequest: ((PairingRequest) -> Void)?
     /// Both sides confirmed. The device (with its new stream key) should be remembered.
     public var onPaired: ((PairedDevice) -> Void)?
-    /// The pairing in progress ended without pairing (the iPad cancelled or left). The listener
-    /// keeps running so the iPad can try again.
+    /// The request on screen ended without pairing (the iPad cancelled or left, or it timed out).
+    /// The listener keeps running so the iPad can try again.
     public var onRequestEnded: (() -> Void)?
 
     private let service: NWListener.Service?
     private let port: NWEndpoint.Port
     private let macID: String
     private let macName: String
+    private let handshakeTimeout: TimeInterval
+    private let confirmationTimeout: TimeInterval
     private var listener: NWListener?
     private var session: Session?
     private var finished = false
 
-    private final class Session {
+    private final class Session: @unchecked Sendable { // only touched on `queue`
+        let id = UUID()
         let connection: LiveLinkConnection
         var deviceName = ""
         var responder: PairingResponder?
@@ -178,10 +190,22 @@ public final class LiveLinkPairingServer: @unchecked Sendable {
         }
     }
 
-    public init(macID: String, macName: String, advertise: Bool, port: NWEndpoint.Port = .any) {
+    /// - Parameter handshakeTimeout: how long a connecting device has to reach the point where the
+    ///   code is shown (this takes well under a second for a real iPad).
+    /// - Parameter confirmationTimeout: how long the people then have to confirm on both devices.
+    public init(
+        macID: String,
+        macName: String,
+        advertise: Bool,
+        port: NWEndpoint.Port = .any,
+        handshakeTimeout: TimeInterval = 15,
+        confirmationTimeout: TimeInterval = 120
+    ) {
         self.port = port
         self.macID = macID
         self.macName = macName
+        self.handshakeTimeout = handshakeTimeout
+        self.confirmationTimeout = confirmationTimeout
         service = advertise ? NWListener.Service(type: LiveLink.pairingServiceType) : nil
     }
 
@@ -221,19 +245,21 @@ public final class LiveLinkPairingServer: @unchecked Sendable {
         }
     }
 
-    /// The person checked the codes match and clicked Pair on the Mac.
-    public func confirm() {
+    /// The person checked the codes match and clicked Pair on the Mac, for the request with this ID.
+    /// Ignored if that request is no longer the one in progress.
+    public func confirm(requestID: UUID) {
         queue.async {
-            guard let session = self.session, session.announced else { return }
+            guard let session = self.session, session.id == requestID, session.announced else { return }
             session.macConfirmed = true
             self.finishIfConfirmed(session)
         }
     }
 
-    /// Turn down the iPad currently asking to pair. The listener keeps running.
-    public func decline() {
+    /// Turn down the request with this ID. The listener keeps running.
+    public func decline(requestID: UUID) {
         queue.async {
-            self.session?.connection.cancel()
+            guard let session = self.session, session.id == requestID else { return }
+            session.connection.cancel()
         }
     }
 
@@ -255,6 +281,15 @@ public final class LiveLinkPairingServer: @unchecked Sendable {
         }
         self.session = session
         connection.start()
+        // A device that connects but never gets as far as showing a code doesn't get to hold pairing.
+        drop(session, after: handshakeTimeout, unless: { $0.announced })
+    }
+
+    private func drop(_ session: Session, after delay: TimeInterval, unless done: @escaping @Sendable (Session) -> Bool) {
+        queue.asyncAfter(deadline: .now() + delay) { [weak self, weak session] in
+            guard let self, let session, self.session === session, !self.finished, !done(session) else { return }
+            session.connection.cancel()
+        }
     }
 
     private func handle(_ message: LiveLinkMessage, in session: Session) {
@@ -273,7 +308,9 @@ public final class LiveLinkPairingServer: @unchecked Sendable {
                 session.responder = responder
                 session.connection.send(.pairNonce(nonce))
                 session.announced = true
-                onRequest?(session.deviceName, code)
+                onRequest?(PairingRequest(id: session.id, deviceName: session.deviceName, code: code))
+                // The people get a fixed time to compare the codes and confirm on both devices.
+                drop(session, after: confirmationTimeout, unless: { _ in false })
             case .pairConfirm(let sealed):
                 guard let responder = session.responder, responder.code != nil,
                       responder.openConfirmation(sealed) else { throw LiveLinkError.pairingFailed }

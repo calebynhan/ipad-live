@@ -113,16 +113,16 @@ final class LiveLinkTests: XCTestCase {
 
     // MARK: - Pairing over loopback
 
-    func testPairingCompletesOnlyAfterBothSidesConfirm() throws {
+    func testPairingCompletesOnlyAfterBothSidesConfirmTheShownRequest() throws {
         let server = LiveLinkPairingServer(macID: "mac-1", macName: "Test Mac", advertise: false)
         let port = try listen(server)
         defer { server.stop() }
 
-        let macCode = Locked<String?>(nil)
+        let shown = Locked<PairingRequest?>(nil)
         let requested = expectation(description: "Mac shows the request")
-        server.onRequest = { name, code in
-            XCTAssertEqual(name, "Test iPad")
-            macCode.set(code)
+        server.onRequest = { request in
+            XCTAssertEqual(request.deviceName, "Test iPad")
+            shown.set(request)
             requested.fulfill()
         }
         let macPaired = Locked<PairedDevice?>(nil)
@@ -149,21 +149,23 @@ final class LiveLinkTests: XCTestCase {
         session.start()
 
         wait(for: [requested, codeShown], timeout: 15)
-        XCTAssertEqual(macCode.get(), iPadCode.get())
+        let request = try XCTUnwrap(shown.get())
+        XCTAssertEqual(request.code, iPadCode.get())
 
-        // Only the iPad confirms: nothing is handed over yet.
-        let notYet = expectation(description: "not paired before the Mac confirms")
+        // The iPad confirms, and the Mac confirms some other (stale) request: nothing is handed over.
+        let notYet = expectation(description: "not paired before the Mac confirms this request")
         notYet.isInverted = true
         server.onPaired = { _ in notYet.fulfill() }
         session.confirm()
+        server.confirm(requestID: UUID())
         wait(for: [notYet], timeout: 1)
 
-        // The Mac confirms too: now both get the same fresh key.
+        // The Mac confirms the request on screen: now both get the same fresh key.
         server.onPaired = { device in
             macPaired.set(device)
             paired.fulfill()
         }
-        server.confirm()
+        server.confirm(requestID: request.id)
         wait(for: [paired, iPadPaired], timeout: 15)
 
         let device = try XCTUnwrap(macPaired.get())
@@ -179,7 +181,7 @@ final class LiveLinkTests: XCTestCase {
         let server = LiveLinkPairingServer(macID: "mac-1", macName: "Test Mac", advertise: false)
         let port = try listen(server)
         defer { server.stop() }
-        server.onRequest = { _, _ in server.decline() }
+        server.onRequest = { request in server.decline(requestID: request.id) }
         let notPaired = expectation(description: "never paired")
         notPaired.isInverted = true
         server.onPaired = { _ in notPaired.fulfill() }
@@ -192,6 +194,54 @@ final class LiveLinkTests: XCTestCase {
         session.start()
         wait(for: [failed], timeout: 15)
         wait(for: [notPaired], timeout: 1)
+    }
+
+    func testASilentConnectionIsDroppedAndFreesPairing() throws {
+        let server = LiveLinkPairingServer(macID: "mac-1", macName: "Test Mac", advertise: false, handshakeTimeout: 0.5)
+        let port = try listen(server)
+        defer { server.stop() }
+
+        // Something connects and then says nothing, which would otherwise hold the only pairing slot.
+        let silent = NWConnection(to: loopback(port), using: .tcp)
+        let connected = expectation(description: "silent connection open")
+        silent.stateUpdateHandler = { state in
+            if case .ready = state { connected.fulfill() }
+        }
+        silent.start(queue: DispatchQueue(label: "silent"))
+        wait(for: [connected], timeout: 10)
+        defer { silent.cancel() }
+        let pause = expectation(description: "let the time limit pass")
+        pause.isInverted = true
+        wait(for: [pause], timeout: 1.5)
+
+        // A real iPad can now pair.
+        let requested = expectation(description: "Mac shows the real request")
+        server.onRequest = { _ in requested.fulfill() }
+        let session = LiveLinkPairingSession(endpoint: loopback(port), deviceName: "Test iPad", queue: DispatchQueue(label: "pair"))
+        session.onFailed = { XCTFail("pairing was blocked: \($0)") }
+        session.start()
+        wait(for: [requested], timeout: 10)
+        session.onFailed = nil // cancelling below is expected, not a failure
+        session.cancel()
+    }
+
+    func testARequestNobodyConfirmsTimesOut() throws {
+        let server = LiveLinkPairingServer(macID: "mac-1", macName: "Test Mac", advertise: false, confirmationTimeout: 0.5)
+        let port = try listen(server)
+        defer { server.stop() }
+
+        let ended = expectation(description: "Mac drops the request")
+        server.onRequestEnded = { ended.fulfill() }
+        let notPaired = expectation(description: "never paired")
+        notPaired.isInverted = true
+        server.onPaired = { _ in notPaired.fulfill() }
+
+        let session = LiveLinkPairingSession(endpoint: loopback(port), deviceName: "Test iPad", queue: DispatchQueue(label: "pair"))
+        let failed = expectation(description: "iPad told pairing failed")
+        session.onFailed = { _ in failed.fulfill() }
+        session.start()
+        wait(for: [ended, failed], timeout: 10)
+        wait(for: [notPaired], timeout: 0.5)
     }
 
     // MARK: - Streaming over loopback

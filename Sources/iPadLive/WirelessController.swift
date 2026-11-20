@@ -11,7 +11,8 @@ final class WirelessController {
 
     enum PairingEvent: Sendable {
         /// An iPad asks to pair: show its name and code, and ask the person to compare with the iPad.
-        case request(deviceName: String, code: String)
+        /// Pass `id` to `confirmPairing(requestID:)`, so Pair only ever applies to the request on screen.
+        case request(id: UUID, deviceName: String, code: String)
         /// The iPad asking to pair went away or cancelled; still waiting for one.
         case requestEnded
         case paired(deviceName: String)
@@ -92,9 +93,10 @@ final class WirelessController {
 
         let server = LiveLinkPairingServer(macID: Settings.wirelessMacID, macName: Self.computerName, advertise: true)
         let serverID = ObjectIdentifier(server)
-        server.onRequest = { @Sendable name, code in
+        server.onRequest = { @Sendable request in
+            let event = PairingEvent.request(id: request.id, deviceName: request.deviceName, code: request.code)
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self.pairingEvent(serverID, .request(deviceName: name, code: code)) }
+                MainActor.assumeIsolated { self.pairingEvent(serverID, event) }
             }
         }
         server.onRequestEnded = { @Sendable in
@@ -118,9 +120,9 @@ final class WirelessController {
         server.start()
     }
 
-    /// The person checked the codes match and clicked Pair.
-    func confirmPairing() {
-        pairingServer?.confirm()
+    /// The person checked the codes match and clicked Pair, for the request with this ID.
+    func confirmPairing(requestID: UUID) {
+        pairingServer?.confirm(requestID: requestID)
     }
 
     func cancelPairing() {

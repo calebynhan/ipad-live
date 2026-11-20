@@ -6,6 +6,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var mirror: MirrorSession!
     private var windowController: MirrorWindowController!
     private var pairingSheet: PairingSheet?
+    /// The pairing request whose code is on screen; Pair confirms only this one.
+    private var shownPairingRequestID: UUID?
     private let deviceMenu = NSMenu(title: "Device")
     private let deviceItemTag = 1001
 
@@ -83,7 +85,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let sheet = PairingSheet()
         pairingSheet = sheet
         sheet.onPair = { [weak self, weak sheet] in
-            self?.mirror.wireless.confirmPairing()
+            guard let self, let requestID = self.shownPairingRequestID else { return }
+            self.mirror.wireless.confirmPairing(requestID: requestID)
             sheet?.showWaitingForIPad()
         }
         sheet.onCancel = { [weak self] in
@@ -93,10 +96,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         mirror.wireless.beginPairing { [weak self] event in
             guard let self else { return }
             switch event {
-            case .request(let deviceName, let code):
+            case .request(let id, let deviceName, let code):
+                self.shownPairingRequestID = id
                 self.pairingSheet?.showCode(deviceName: deviceName, code: code)
             case .requestEnded:
-                self.pairingSheet?.showWaiting(note: "The iPad stopped pairing.")
+                self.shownPairingRequestID = nil
+                self.pairingSheet?.showWaiting(note: "The iPad stopped pairing, or it took too long.")
             case .paired(let deviceName):
                 self.closePairingSheet()
                 self.showPairingAlert(
@@ -114,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func closePairingSheet() {
+        shownPairingRequestID = nil
         guard let sheet = pairingSheet else { return }
         pairingSheet = nil
         sheet.onPair = nil
