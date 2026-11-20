@@ -221,6 +221,7 @@ final class LiveLinkTests: XCTestCase {
         session.onFailed = { XCTFail("pairing was blocked: \($0)") }
         session.start()
         wait(for: [requested], timeout: 10)
+        session.onFailed = nil // cancelling below is expected, not a failure
         session.cancel()
     }
 
